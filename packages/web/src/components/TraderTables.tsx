@@ -1100,6 +1100,9 @@ export function PositionsTable({
                       ? '挂单中'
                       : '无'}
                 </div>
+                {targetDistance && (
+                  <div className="text-xs text-ink-faint">{targetDistance}</div>
+                )}
               </td>
 
                   <td className="td num text-right">
