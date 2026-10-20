@@ -9020,7 +9020,29 @@ reduceQuantity: null,
 
   private async applyBreakevenGuard(): Promise<number> {
     const traderId = this.deps.trader.id;
-    const threshold = this.activeConfig.riskControl.breakevenTriggerPercent;
+    /*
+     * ⚠️⚠️ **JEV 模式的保本阈值必须走 JEV 选项**（2026-10-20 实盘抓到）。
+     *
+     * ## 症状
+     *
+     * 用户在界面上把 `breakeven_trigger_percent` 设成 5、`trailing_stop_percent` 设成 3，
+     * 而日志里还在说「已达保本阈值 **3%**，按价格回撤 **1%** 追踪」——
+     * 那是 `defaultJevConfig()` 的出厂值，不是用户设的那一组。
+     *
+     * ## 根因
+     *
+     * 这一行和下面 `trailPercent` 那行都读 `this.activeConfig`，
+     * 而 JEV 的覆盖只发生在决策循环内部的 `effectiveConfig()` 上 ——
+     * **机械保护这一组方法（保本/回撤/过期撤单）全都没走那条路**。
+     *
+     * 这类"配置读错对象"已经犯了三次（熔断、横幅、现在这个）。
+     * ⇒ 统一原则：JEV 模式下所有运行期配置都从 `jevNumber()` / `jevBool()` 现读，
+     *   **不再从 `activeConfig` 里拿**。
+     */
+    const threshold =
+      this.deps.trader.mode === 'jev'
+        ? Math.max(0, jevNumber('breakeven_trigger_percent'))
+        : this.activeConfig.riskControl.breakevenTriggerPercent;
 
     // 阈值为 0 表示关闭这条规则 —— 连行情都不必拉。
     if (!(threshold > 0)) return 0;
@@ -9073,7 +9095,11 @@ reduceQuantity: null,
          * ⚠️ 它必须与 `breakevenTriggerPercent` 一起读 —— 只配后者不配前者，
          * 就是那条被实测证明会回吐 27% 浮盈的旧行为。
          */
-        trailPercent: this.activeConfig.riskControl.trailingStopPercent,
+        /* 与上面 `threshold` 同一个理由 —— JEV 模式下从 JEV 选项现读。 */
+        trailPercent:
+          this.deps.trader.mode === 'jev'
+            ? Math.max(0, jevNumber('trailing_stop_percent'))
+            : this.activeConfig.riskControl.trailingStopPercent,
       });
 
       if (!verdict.move || verdict.newStop === null) continue;
@@ -10357,7 +10383,24 @@ reduceQuantity: null,
      * ⇒ **模型不写 / 写错 = 行为与改动前逐字一致**。这条保证很重要：
      * 团队模式在持续盈利，任何一次发版都不该悄悄改变它的风险特征。
      */
-    const wantedMode = decision.marginMode ?? this.activeConfig.riskControl.marginMode;
+    /*
+     * ⚠️ **JEV 模式的保证金模式要读 JEV 选项**（2026-10-20，与保本阈值同一批）。
+     *
+     * `margin_mode` 的可选值是 `isolated` / `crossed` / `jev`（让 Jev 判断）。
+     * 决策里带了 `marginMode` 时以决策为准（`resolveMarginMode()` 已经把
+     * "让 Jev 判断"解析成了具体值）；决策没带时才回落 —— 而 JEV 模式
+     * **不能**回落到 `activeConfig` 那个写死的值，那会绕过用户在界面上选的东西。
+     */
+    const wantedMode =
+      decision.marginMode ??
+      (this.deps.trader.mode === 'jev'
+        ? (() => {
+            const configured = jevEnum('margin_mode');
+            /* `jev` 表示"由 Jev 判断"—— 那条路径由 `resolveMarginMode()` 走决策侧，
+             * 走到这里说明决策没给，保守回落逐仓（最不容易被单笔打穿全账户）。 */
+            return configured === 'crossed' ? ('crossed' as const) : ('isolated' as const);
+          })()
+        : this.activeConfig.riskControl.marginMode);
     if (this.marginSet.get(symbol) !== wantedMode) {
       const ok = await this.deps.broker.setMarginType(
         symbol,
