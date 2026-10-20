@@ -1771,6 +1771,47 @@ export class TraderManager {
   }
 
   /**
+   * **这个机器人现在该用模拟盘还是实盘**（2026-10-21 修）。
+   *
+   * ## 为什么需要它（而不是直接用 `dryRunOf`）
+   *
+   * `dryRunOf()` 只对**运行中**的机器人有效 —— 它读的是内存里的实例。
+   * 而手工平仓/全部平仓/对账这三条路径**恰恰是为"已停止的机器人"准备的**
+   *（它们会建一次性实例），那时 `dryRunOf()` 返回 `null`。
+   *
+   * 那三处原来的写法是把 `false` **硬编码**进 `connectionFor()`：
+   * ```ts
+   * const connection = await this.connectionFor(traderId, acctId, false);
+   * ```
+   * ⇒ 模拟盘机器人被停止后，它的**虚拟持仓**会被拿去真实交易所平仓。
+   *
+   * ## 实盘症状（2026-10-21 用户报告）
+   *
+   * ```
+   *   #11（dry_run=1）点了「全部平仓」
+   *   → 「SOLUSDT 手工平仓失败：币安错误 -2022：ReduceOnly Order is rejected」
+   *   → 界面报「2 个平仓失败，敞口还在，请立即处理」
+   * ```
+   * `-2022` 的含义是"没有可减的仓位" —— 因为账户上**根本没有**那些仓位
+   *（它们是本地的模拟记录）。所以那次没有损失，**但那是运气**：
+   * 如果账户上恰巧有同名仓位（别的机器人或手工开的），模拟盘会把它平掉。
+   *
+   * ## 口径
+   *
+   * 与 `resumePersisted` / `attemptStart` 一致：
+   * ```
+   *   运行中的实例（最准） → 数据库里机器人自己记的 → 进程级 env（最后回落）
+   * ```
+   * ⚠️ **`env.dryRun` 只能做最后回落** —— 它是**进程级**开关，用它去覆盖
+   * 单个机器人的选择曾经造成过 `#11` 被实盘恢复的事故（见本文件顶部那段）。
+   */
+  private effectiveDryRun(traderId: number, trader: { dryRun?: boolean | null }): boolean {
+    const running = this.dryRunOf(traderId);
+    if (running !== null) return running;
+    return trader.dryRun ?? env.dryRun;
+  }
+
+  /**
    * **启动代数**：每个机器人最近一次启动的序号。
    *
    * 用途只有一个：让"上一次启动的看门狗/回调"能判断自己是否已经过期，
@@ -3819,7 +3860,7 @@ export class TraderManager {
     const live = this.running.get(traderId);
     if (live) return live.runReconcile();
 
-    const connection = await this.connectionFor(traderId, trader.exchangeAccountId, false);
+    const connection = await this.connectionFor(traderId, trader.exchangeAccountId, this.effectiveDryRun(traderId, trader));
     /* `null` = 不依赖策略（AI 托管）；这里本来就已容错，只是要接受空值。 */
     const strategyRecord =
       trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
@@ -3886,7 +3927,7 @@ export class TraderManager {
      * 那会让"按一个按钮"变成"等一次模型请求"，而且在模型故障时根本用不了。
      * **操作员的退出路径不能依赖任何外部服务。**
      */
-    const connection = await this.connectionFor(traderId, trader.exchangeAccountId, false);
+    const connection = await this.connectionFor(traderId, trader.exchangeAccountId, this.effectiveDryRun(traderId, trader));
     /* `null` = 不依赖策略（AI 托管）—— 手工平仓同理，绝不能因为策略没了就用不了。 */
     const strategyRecord =
       trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
@@ -3967,7 +4008,7 @@ export class TraderManager {
          * 已停止：建一个一次性实例（与 `closePosition` 同一条路径）。
          * 模型换成"永远拒绝"的桩 —— 撤单绝不该调用 LLM。
          */
-        const connection = await this.connectionFor(traderId, trader.exchangeAccountId, false);
+        const connection = await this.connectionFor(traderId, trader.exchangeAccountId, this.effectiveDryRun(traderId, trader));
         const strategyRecord =
           trader.strategyId === null ? undefined : strategies.get(trader.strategyId);
         const config: StrategyConfig = this.configOf(strategyRecord);

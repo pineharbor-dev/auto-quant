@@ -194,3 +194,122 @@ test('★★★ cancelOpenBySymbol 只动 NEW，不改写历史状态', () => {
     '★ 应当写成 CANCELED（与交易所侧一致）',
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/*  停止后不能再开仓 / 模拟盘平仓不能碰交易所（2026-10-21 用户报告）              */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 停止请求必须在【下单前】拦住（停止后还在开仓的 BUG）', () => {
+  /*
+   * ## 用户原话
+   *
+   * > 「我停止了机器人，不光不平仓，好像还在开仓」
+   *
+   * ## 实测（#11，ai_team 模式）
+   *
+   * ```
+   *   16:32:36  机器人已停止（操作员手动停止）
+   *   16:32:36  ⚠️ 停止时上一轮决策未在时限内结束
+   *   16:35:28  已开仓 DOGEUSDT 空头 63 @ 0.081     ← 停止后 3 分钟还在开仓
+   *   16:35:29  已开仓 HYPEUSDT 空头 0.07 @ 79.63
+   * ```
+   *
+   * ## 根因
+   *
+   * `stop()` 只做了 `abortCurrentCycle.abort()` —— 那中断的是**在途 HTTP 请求**，
+   * 而 `ai_team` 的一轮决策要跑 2-5 分钟，循环会接着跑完剩下步骤。
+   *
+   * ⇒ 必须有一个**流程级**的标志，并在下单前检查。
+   */
+  assert.ok(
+    /private stopRequestedAt: number \| null = null/.test(AUTO),
+    '★ 必须记录停止请求的时刻（时间戳，不是布尔 —— 见下）',
+  );
+  assert.ok(
+    /this\.stopRequestedAt = Date\.now\(\)/.test(AUTO),
+    '★ stop() 里必须记下时刻',
+  );
+
+  /*
+   * ⚠️ **判据用的是「这一轮的开始时刻 vs 停止时刻」，不是布尔标志。**
+   *
+   * 我第一版写成布尔 + "本轮是否已执行过决策"，结果撞上了既有契约：
+   * `start()` 后立刻 `stop()` 时，那一轮已经在 `await complete()` 里
+   * 但还没到执行循环 —— 布尔判据会把它整轮跳过，于是
+   * "stopping a trader waits for the cycle already in flight" 立刻变红
+   *（那意味着已成交的仓位会裸奔，§2.6）。
+   *
+   * 时间戳判据能精确区分：
+   * ```
+   *   cycleStartedAt <  stopRequestedAt  ⇒ 停止前就在跑 ⇒ 放行（挂完保护单）
+   *   cycleStartedAt >= stopRequestedAt  ⇒ 停止后才开始 ⇒ 跳过（不开新仓）
+   * ```
+   */
+  assert.ok(
+    /private cycleStartedAt = 0/.test(AUTO),
+    '★ 必须记录本轮开始时刻',
+  );
+  assert.ok(
+    /this\.cycleStartedAt = Date\.now\(\)/.test(AUTO),
+    '★ runCycle 开头必须写它',
+  );
+  assert.ok(
+    /cycleStartedBeforeStop/.test(AUTO),
+    '★ 必须有「停止前就在跑」的判据',
+  );
+
+  const guardAt = AUTO.indexOf('cycleStartedBeforeStop');
+  const loopAt = AUTO.indexOf('for (const decision of verdict.approved)');
+  assert.ok(guardAt > 0, '★ 必须有停止判据');
+  assert.ok(
+    AUTO.indexOf('cycleStartedBeforeStop', loopAt) > loopAt,
+    '★ 判据必须在下单循环【内部】—— 放在循环前会破坏"停止要等保护单"的契约',
+  );
+});
+
+test('★★★ 模拟盘的手工平仓不能调用交易所', () => {
+  /*
+   * ## 用户原话
+   *
+   * > 「[团队测试] 多智能体，我把它停止了，然后点全部平仓失败了」
+   *
+   * 界面报「0 个已平，2 个平仓失败。失败的标的仍未平掉，敞口还在，请立即处理」，
+   * 而那两个持仓是**模拟盘的本地记录** —— 交易所上根本没有对应仓位
+   *（币安返回 `-2022 ReduceOnly Order is rejected`）。
+   *
+   * **那句「敞口还在」是在吓唬操作员**：一分钱真实风险都没有。
+   */
+  const closeManually = /async closeManually\(symbol: string\)[\s\S]*?\n  \}/.exec(AUTO);
+  assert.ok(closeManually !== null, '★ 应当能找到 closeManually');
+  assert.ok(
+    /if \(this\.isDryRun\) \{[\s\S]*?getMarkPrice/.test(closeManually![0]),
+    '★ 模拟盘分支必须用标记价结算（模拟盘没有真实成交价）',
+  );
+  assert.ok(
+    /不会编造价格/.test(closeManually![0]),
+    '★ 标记价读不到时必须明确失败，不能编一个价格污染账本',
+  );
+});
+
+test('★★★ 模拟盘的连接不能硬编码成实盘（effectiveDryRun）', () => {
+  /*
+   * 手工平仓/全部平仓/对账这三条路径会为「已停止的机器人」建一次性实例，
+   * 那时 `dryRunOf()` 返回 null。原来那三处把 `false` 硬编码进
+   * `connectionFor()` ⇒ 模拟盘的虚拟持仓被拿去真实交易所平仓。
+   *
+   * ⚠️ 那次没造成损失是**运气**：如果账户上恰巧有同名仓位（别的机器人
+   * 或手工开的），模拟盘会把它平掉。
+   */
+  const MANAGER = readFileSync(new URL('./manager.ts', import.meta.url), 'utf8');
+  assert.ok(
+    /private effectiveDryRun\(/.test(MANAGER),
+    '★ 必须有 effectiveDryRun（运行实例 → 数据库 → env 三级回落）',
+  );
+  const hardcoded = (MANAGER.match(/connectionFor\(traderId, trader\.exchangeAccountId, false\)/g) ?? [])
+    .length;
+  assert.equal(
+    hardcoded,
+    0,
+    '★ 不能再有硬编码 false 的 connectionFor —— 那会让模拟盘碰真实交易所',
+  );
+});

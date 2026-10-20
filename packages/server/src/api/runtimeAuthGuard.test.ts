@@ -255,6 +255,20 @@ function sensitiveEndpoints(): SensitiveEndpoint[] {
     },
     {
       method: 'POST',
+      route: '/api/traders/:id/jev-presets/:presetId',
+      url: `/api/traders/${traderId}/jev-presets/balanced`,
+      /*
+       * ⚠️ **不走 `manager`**（所以没有 `expectsManagerCall`）—— 它一次写 20+ 条
+       * `settings`，把整组 JEV 参数换成预设值。
+       *
+       * 为什么敏感：`balanced` 预设会把 `risk_percent` / `max_positions` /
+       * `max_margin_usage` 一起改掉 —— 那是**一次调用就改变整个风险特征**。
+       * 未认证时必须 401 且零副作用。
+       */
+      why: '一键套用 JEV 参数预设 —— 一次改写 20+ 个风险参数，会立刻改变交易行为',
+    },
+    {
+      method: 'POST',
       route: '/api/traders/:id/control/:key',
       url: `/api/traders/${traderId}/control/jev_prefilter`,
       payload: { on: false },

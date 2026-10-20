@@ -1105,6 +1105,20 @@ export class AutoTrader {
    * 138K 字符提示词的僵尸，累积起来把进程拖死。
    */
   private abortCurrentCycle: AbortController | null = null;
+
+  /**
+   * **操作员已请求停止**（2026-10-21 实盘抓到的 BUG：停止后 3 分钟还在开仓）。
+   *
+   * `stop()` 原来只做 `abortCurrentCycle.abort()` —— 那中断的是**在途 HTTP 请求**，
+   * 而 `ai_team` 的一轮决策要跑 2-5 分钟，循环会接着跑完剩下步骤（包括下单）。
+   *
+   * ⚠️ **单向**：一旦置位不再清除。这台实例被丢弃，下次启动是新建的。
+   * 双向开关会让"停止中又启动"的竞态重新打开。
+   */
+  private stopRequestedAt: number | null = null;
+
+  /** 当前这一轮的开始时刻（`runCycle` 开头写）。停止判据用它。 */
+  private cycleStartedAt = 0;
   /**
    * 有多少轮"超时了但还没真正结束"。
    *
@@ -1924,6 +1938,11 @@ export class AutoTrader {
      *
      * 所以掐断只在 `persist === true` 时做。
      */
+    /*
+     * ⚠️ **置位必须发生在 abort 之前**：abort 触发的错误处理可能先跑完，
+     * 而在那个窗口里循环仍会认为"没被要求停止"。
+     */
+    this.stopRequestedAt = Date.now();
     if (persist) {
       this.abortCurrentCycle?.abort();
     }
@@ -2842,6 +2861,14 @@ export class AutoTrader {
    */
   private async runCycle(cycleNumber: number, signal?: AbortSignal): Promise<string> {
     const traderId = this.deps.trader.id;
+    /*
+     * **本轮的开始时刻** —— 停止检查用它区分「停止前就在跑的那一轮」
+     * 与「停止之后才开始的新轮次」。见执行循环里那个判据的说明。
+     *
+     * ⚠️ 用**成员变量**而不是往下传参数：`runCycleBody` 的签名已经很长，
+     * 而这个值只被一个地方读（执行循环里的停止判据）。
+     */
+    this.cycleStartedAt = Date.now();
 
     /*
      * 本轮**已经拿到的东西**，边走边填。
@@ -5015,7 +5042,70 @@ export class AutoTrader {
      */
     const modeBlocked = this.positionModeBlocked;
 
+
     for (const decision of verdict.approved) {
+      /*
+       * ⚠️⚠️ **停止请求在这里拦住「还没执行的」下单**（2026-10-21 实盘 BUG）。
+       *
+       * 用户报告：「我停止了机器人，不光不平仓，好像还在开仓」。
+       * 实测 `#11`：16:32:36 停止，16:35:28 又开了两个仓。
+       *
+       * ## 为什么检查在**循环内部**而不是循环之前
+       *
+       * 既有契约（`autoTrader.test.ts` 的 "stopping a trader waits for the cycle
+       * already in flight"）要求：**`stop()` 必须等正在跑的那一轮把保护单挂完**。
+       * 那是 §2.6 的底线 —— 中途退出会留下没有止损的杠杆仓位。
+       *
+       * 在循环之前一刀切地清空 `approved` 会**同时废掉那个契约**
+       *（实测：那条测试立刻变红）。
+       *
+       * ⇒ 正确粒度是**逐个决策**：已经开出去的仓位继续跑完它自己的保护单流程，
+       *   而**还没开始的**那些直接不执行。
+       */
+      /*
+       * ══════════════════════════════════════════════════════════════════════
+       *  ⚠️⚠️ **停止后不再开新仓，但已经跑起来的那一轮要跑完**
+       *      （2026-10-21 实盘 BUG：停止后 3 分钟还在开仓）
+       * ══════════════════════════════════════════════════════════════════════
+       *
+       * ## 两个必须同时成立的要求
+       *
+       * ```
+       *   ① 用户点了停止 ⇒ 不该再有**新的**开仓
+       *   ② 已经跑起来的那一轮 ⇒ 必须把保护单挂完（否则仓位裸奔，§2.6）
+       * ```
+       * `autoTrader.test.ts` 的 "stopping a trader waits for the cycle already
+       * in flight" 钉的是 ②；而 2026-10-21 的实盘 BUG 违反的是 ①。
+       *
+       * ## 判据：**这一轮是不是在停止请求之后才开始的**
+       *
+       * ```
+       *   cycleStartedAt < stopRequestedAt  ⇒ 这一轮在停止前就在跑
+       *                                       ⇒ 放行（把 ② 做完）
+       *   cycleStartedAt >= stopRequestedAt ⇒ 停止之后才开的轮次
+       *                                       ⇒ 全部跳过（满足 ①）
+       * ```
+       * ⚠️ **不能用"是否已经执行过决策"来判断**（我第一版就是那样）：
+       * 实测 `start()` 后立刻 `stop()` 时，那一轮已经在 `await complete()`
+       * 里、但还没到执行循环 —— 用 `executedAny` 会把它整轮跳过，
+       * 于是那条契约测试立刻变红（"stop() must not return before the
+       * in-flight cycle has placed its protection"）。
+       * 而按**轮次开始时间**判断就精确了：那一轮确实在停止前就开始了。
+       */
+      const cycleStartedBeforeStop =
+        this.stopRequestedAt !== null && this.cycleStartedAt < this.stopRequestedAt;
+      if (this.stopRequestedAt !== null && !cycleStartedBeforeStop) {
+        progress.executionLog.push({
+          action: decision.action,
+          symbol: decision.symbol,
+          status: 'skipped',
+          detail:
+            '操作员已请求停止 —— 这一轮是在停止之后开始的，不执行任何下单' +
+            '（停止前已在跑的那一轮会各自把保护单挂完）。',
+        });
+        continue;
+      }
+
       if (modeBlocked !== null) {
         progress.executionLog.push({
           action: decision.action,
@@ -12312,9 +12402,38 @@ reduceQuantity: null,
 
     // ② 市价平仓。
     const exitSide: 'BUY' | 'SELL' = local.side === 'long' ? 'SELL' : 'BUY';
-    const flatten = await this.emergencyFlatten(symbol, local.quantity, exitSide, traderId);
-    if (!flatten) {
-      throw new Error(`${symbol} 手工平仓失败：交易所没有接受平仓单。`);
+
+    /*
+     * ⚠️⚠️ **模拟盘的平仓走本地，不能碰交易所**（2026-10-21 用户报告）。
+     *
+     * 用户原话：「[团队测试] 多智能体，我把它停止了，然后点全部平仓失败了」。
+     * 界面报「0 个已平，2 个平仓失败。失败的标的仍未平掉，敞口还在，请立即处理」，
+     * 而日志里的真因是 `币安错误 -2022：ReduceOnly Order is rejected`。
+     *
+     * 根因：那两个持仓是**模拟盘的本地记录**，交易所上根本没有对应仓位。
+     * 而 `closeManually()` 无差别地调 `emergencyFlatten()` → 币安说"没有可减的仓位"。
+     *
+     * 那句「敞口还在，请立即处理」更是雪上加霜：**它在吓唬操作员说有真实风险，
+     * 而实际上一分钱都没有**（那是模拟盘）。
+     *
+     * ⚠️ 标记价读不到时**不能编一个价格** —— 那会永久污染账本。
+     */
+    let flatten: { avgPrice: number; fee: number } | null;
+    if (this.isDryRun) {
+      const mark = await this.deps.broker.getMarkPrice(symbol).catch(() => 0);
+      if (!(mark > 0)) {
+        throw new Error(
+          `${symbol} 手工平仓失败：模拟盘读不到标记价，无法结算（不会编造价格）。请稍后重试。`,
+        );
+      }
+      /* 模拟盘按真实费率记手续费 —— 否则回测净额会偏乐观。 */
+      const feeRate = this.effectiveConfig().riskControl.fallbackRoundTripFeeRate;
+      flatten = { avgPrice: mark, fee: local.quantity * mark * feeRate * 0.5 };
+    } else {
+      flatten = await this.emergencyFlatten(symbol, local.quantity, exitSide, traderId);
+      if (!flatten) {
+        throw new Error(`${symbol} 手工平仓失败：交易所没有接受平仓单。`);
+      }
     }
 
     // ③ 记账 —— 唯一算净额的地方。
