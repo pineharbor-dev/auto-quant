@@ -250,6 +250,55 @@ export const JEV_OPTIONS: readonly JevOptionSpec[] = [
     fallback: 'on',
   },
   {
+    key: 'max_pump_percent',
+    label: '追高上限',
+    why:
+      '24 小时涨幅超过这个百分比的标的不做。' +
+      '⚠️ 这些币成交额爆发所以会排在候选池前面，但它们是**已经涨完了**的币 —— ' +
+      '实盘实测：候选里出现 +106%（RSI 80.8）和 +42% 的币，' +
+      'Jev 给了 97-98% 置信度要做多，那就是追高。' +
+      '设 0 = 不限制（不建议）。',
+    kind: 'number',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  **为什么需要这个过滤**（2026-10-20 实盘抓到）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 症状
+     *
+     * ```
+     *   候选池：BRUSDT +42%、JCTUSDT +106%（RSI 80.76）
+     *   Jev：QUSDT 做多 97%、BRUSDT 做多 97%、PHAUSDT 做多 98%
+     *   ⇒ 它"很确定"这些会继续涨 —— 而那正是追高的形状
+     * ```
+     * 那段时间账户在跌（BTC -0.94%、ETH -1.40%），但候选池里**全是暴涨币**。
+     *
+     * ## 根因不在 Jev，在选币
+     *
+     * 选币按「成交额 + 持仓量」排序，而暴涨币的成交额会爆炸式增长 ⇒
+     * 它们总是排在最前面，把正常标的挤出候选池。
+     * 于是 Jev 看到的"全部市场"其实是一张**涨幅榜**。
+     *
+     * ## 为什么阈值定 20%
+     *
+     * ```
+     *   日内 +20% 在合约里已经是很强的单边行情
+     *   那时进场做多 = 给早期的多头接盘（他们正在派发）
+     *   而做空 = 逆着最强势的标的，同样危险
+     *   ⇒ 两边都不该碰，直接跳过
+     * ```
+     * 20% 也是「正常趋势」与「爆炒」的分界线：主流币日内很少超过 15%，
+     * 而垃圾币一天 50-100% 很常见。
+     *
+     * ## ⚠️ 这是过滤，不是判断
+     *
+     * 代码只回答"涨太多了，跳过"，**不判断该不该做空**。
+     * 那是 Jev 的事 —— 我们只把明显不该参与的场景排除掉。
+     */
+    range: { min: 0, max: 200, step: 5, unit: '%' },
+    fallback: '20',
+  },
+  {
     key: 'min_confidence',
     label: '出手门槛',
     why:
@@ -717,6 +766,7 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_resize: 'true',
       allow_trailing: 'true',
       leverage_manual: '20',
+      max_pump_percent: '20',
     },
   },
   {
@@ -744,6 +794,7 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_resize: 'true',
       allow_trailing: 'true',
       leverage_manual: '20',
+      max_pump_percent: '30',
     },
   },
   {
@@ -771,6 +822,7 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_resize: 'false',
       allow_trailing: 'true',
       leverage_manual: '10',
+      max_pump_percent: '10',
     },
   },
 ];

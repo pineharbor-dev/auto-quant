@@ -3471,7 +3471,64 @@ export class AutoTrader {
      */
     if (this.deps.trader.mode === 'jev') {
       const selectMode = jevEnum('coin_select');
-      
+
+      /*
+       * ══════════════════════════════════════════════════════════════════════════
+       *  **追高过滤：24h 涨幅过大的标的直接跳过**（2026-10-20 实盘抓到）
+       * ══════════════════════════════════════════════════════════════════════════
+       *
+       * ## 事故
+       *
+       * ```
+       *   候选池：BRUSDT +42.09%、JCTUSDT +106.07%（RSI 80.76）
+       *   Jev：QUSDT 做多 97%、BRUSDT 做多 97%、PHAUSDT 做多 98%
+       *   ⇒ 它"很确定"这些会继续涨，而那是追高的形状
+       * ```
+       * 同期账户在跌（BTC -0.94%、ETH -1.40%），但候选池里全是暴涨币。
+       *
+       * ## 根因不在 Jev，在选币
+       *
+       * 选币按「成交额 + 持仓量」排序，暴涨币的成交额爆炸式增长 ⇒
+       * 它们总排最前，把正常标的挤出去。于是 Jev 看到的"整个市场"
+       * 其实是一张涨幅榜 —— **它的判断没错，错的是喂给它的候选**。
+       *
+       * ## 为什么必须在这一步过滤（而不是靠 Jev 自己拒绝）
+       *
+       * 实测它给这些币的置信度是 **97-98%** —— 它非常确信。
+       * 一个"很确信要追高"的分类器，你没法靠提示词让它自己刹车；
+       * 而一个在候选池里就不存在的标的，它没有机会去追。
+       *
+       * ⚠️ **放在 `rerankByJev` 之前**：先砍掉暴涨币，再让 Jev 从
+       * 剩下的正常标的里挑。反过来做（先让 Jev 挑、再过滤）会让它
+       * 把额度花在注定被丢弃的标的上。
+       */
+      const maxPumpPercent = Math.max(0, jevNumber('max_pump_percent'));
+      if (maxPumpPercent > 0) {
+        const before = snapshots.length;
+        const pumped = snapshots.filter(
+          (snap) => Math.abs(snap.priceChangePercent24h) > maxPumpPercent,
+        );
+        if (pumped.length > 0) {
+          snapshots = snapshots.filter(
+            (snap) => Math.abs(snap.priceChangePercent24h) <= maxPumpPercent,
+          );
+          this.emit(
+            'info',
+            `[Jev模式] 追高过滤：${pumped.length} 个标的 24h 涨幅超过 ${maxPumpPercent}%（` +
+              pumped
+                .slice(0, 4)
+                .map((s) => `${s.symbol} ${s.priceChangePercent24h.toFixed(1)}%`)
+                .join('、') +
+              `${pumped.length > 4 ? ' 等' : ''}）—— 跳过它们，${before} → ${snapshots.length} 个候选`,
+          );
+        }
+        /*
+         * ⚠️ **全被过滤掉时不补回**：那是"今天全市场都在暴涨"的信号，
+         * 正确反应是**这一轮不做**（等下一轮），而不是硬选几个出来做。
+         * 下面 `snapshots.length === 0` 的既有分支会让本轮直接跳过。
+         */
+      }
+
       if (selectMode !== 'code') {
         const jevRerank = this.deps.model as {
           rerankByJev?: (

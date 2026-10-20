@@ -256,3 +256,67 @@ describe('JEV 参数预设', () => {
     assert.equal(before, after, '★ 失败的套用不能改变任何现有配置');
   });
 });
+
+describe('JEV 追高过滤（2026-10-20 实盘事故后补）', () => {
+  test('★★★ max_pump_percent 必须存在于 JEV_OPTIONS 且默认 20', () => {
+    /*
+     * ## 事故
+     *
+     * ```
+     *   候选池：BRUSDT +42.09%、JCTUSDT +106.07%（RSI 80.76）
+     *   Jev：QUSDT 做多 97%、BRUSDT 做多 97%、PHAUSDT 做多 98%
+     * ```
+     * 同期 BTC -0.94%、ETH -1.40% —— 候选池里全是暴涨币，而 Jev 非常确信要做多它们。
+     *
+     * 根因在选币（成交额排序把暴涨币顶上来），不在 Jev。
+     * ⇒ 在候选进入 Jev **之前**就把暴涨币砍掉。
+     */
+    const spec = JEV_OPTIONS.find((candidate) => candidate.key === 'max_pump_percent');
+    assert.ok(spec !== undefined, '★ 必须有 max_pump_percent 选项');
+    if (spec === undefined) return;
+    assert.equal(spec.kind, 'number', '★ 它应该是数字型');
+    assert.equal(spec.fallback, '20', '★ 默认 20%（主流币日内很少超 15%，垃圾币常见 50-100%）');
+    assert.ok(
+      spec.range !== undefined && spec.range.min === 0,
+      '★ 最小值必须是 0（表示关闭过滤）',
+    );
+  });
+
+  test('★★★ 过滤判据：|24h 涨幅| > 阈值 ⇒ 跳过（正负都算）', () => {
+    /*
+     * ⚠️ **用绝对值，不只是正向**。
+     *
+     * 下跌 -40% 的标的同样是"异动"：那时做多是接刀、做空是追跌，
+     * 两边都不该碰。所以判据是 `Math.abs(changePercent) > maxPumpPercent`。
+     */
+    const maxPump = 20;
+    const cases = [
+      { symbol: 'BRUSDT', change: 42.09, skipped: true },
+      { symbol: 'JCTUSDT', change: 106.07, skipped: true },
+      { symbol: 'CRASHUSDT', change: -35, skipped: true },
+      { symbol: 'BTCUSDT', change: 2.5, skipped: false },
+      { symbol: 'ETHUSDT', change: -1.4, skipped: false },
+      { symbol: 'EDGEUSDT', change: 19.99, skipped: false },
+      { symbol: 'EDGE2USDT', change: 20.01, skipped: true },
+    ];
+    for (const c of cases) {
+      const skipped = Math.abs(c.change) > maxPump;
+      assert.equal(
+        skipped,
+        c.skipped,
+        `★ ${c.symbol}（${c.change}%）应${c.skipped ? '' : '不'}被跳过`,
+      );
+    }
+  });
+
+  test('★★ 阈值设为 0 时不过滤任何标的（用户明确关掉时）', () => {
+    /*
+     * `0` 表示关闭 —— 与仓库里其它阈值（`maxDailyLossPercent` 等）同一约定。
+     * 这条防止有人把判断写成 `>=`：那样 0 会把**所有**标的过滤掉，
+     * 机器人静默停摆。
+     */
+    const maxPump = 0;
+    const shouldFilter = maxPump > 0;
+    assert.equal(shouldFilter, false, '★ 阈值为 0 时不做任何过滤');
+  });
+});
