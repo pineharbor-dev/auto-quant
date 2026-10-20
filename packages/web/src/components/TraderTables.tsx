@@ -2675,22 +2675,30 @@ export function TraderTables({
    *   「全部平仓」按钮 disabled ⇒ 操作员点不了
    * ```
    *
-   * ## 根因
+   * ## 根因（两层）
    *
-   * `positionCount` 是**页面从 WebSocket 事件里算的**（见 `TraderPage` 里那条注释），
-   * 它有自己的更新节奏；而表格渲染用的是 `positions`（`/account` 的实时读数）。
-   * 两者在"机器人刚停止、WS 不再推送"时会**永久分叉** ——
-   * 而机器人停止恰恰是操作员最想点「全部平仓」的时刻。
+   * ① `positionCount` 是页面从 **WebSocket 事件**里算的 —— 机器人停止后
+   *    就不再推送，于是它永久停在旧值。
+   * ② 我第一版改成读 `positions` prop，**但还是 0** —— 因为那张表的数据
+   *    **不是**来自这个 prop：`PositionsTable` 自己用 `usePolled` 拉
+   *    `/positions`。prop 里的 `positions` 是另一个用途（订单表的兜底映射）。
    *
    * ## 修法
    *
-   * 判据用 `positions.length`（**屏幕上真实渲染的那份**）。
-   * 那是操作员眼睛看到的东西 —— 按钮该跟它一致，而不是跟一个看不见的计数一致。
-   *
-   * ⚠️ `positions` 是可选 prop（老调用点可能不传）：缺失时回落到 `positionCount`，
-   * 保证既有行为不变。
+   * **在这里也拉一次 `/positions`**，与 `PositionsTable` 同一个端点、
+   * 同一个 `pickPositions` 合并规则。这样：
+   * ```
+   *   表格里渲染几行  ⇔  按钮认为有几个  ⇔  同一个数据源
+   * ```
+   * 代价是切到别的标签时也会拉一次（与订单表那段注释同一个取舍：
+   * 15 秒一次的小请求，换来"数字与表格永远一致"）。
    */
-  const closableCount = positions?.length ?? positionCount;
+  const livePositions = useEvents((s) => s.byTrader[traderId]?.positions);
+  const positionsQuery = usePolled((signal) => api.traderPositions(traderId, signal), {
+    intervalMs: 15_000,
+    deps: [traderId, token],
+  });
+  const closableCount = pickPositions(positionsQuery.data, livePositions).length;
 
   const tabs: Array<{ id: TraderTabId; label: string; count?: number }> = [
     { id: 'positions', label: '当前持仓', count: closableCount },
