@@ -214,3 +214,75 @@ test('★★★ `calibratedEquity` 与列表页「归属权益」必须是同一
     '★ 服务端的 attributedEquity 仍是同一个公式',
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/*  曲线口径不能因为机器人停止而改变（2026-10-21 用户报告）                        */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 曲线口径必须用 isPaperView 的三级回落，不能只读 stats.dryRun', () => {
+  /*
+   * ## 用户原话
+   *
+   * > 「图表也和 JEV 一样有 BUG，停了就不显示了」
+   *
+   * ## 实测
+   *
+   * ```
+   *   #11（模拟盘）运行中 → 曲线有形状 ✅
+   *   点了「停止」       → 曲线变成一条平线 ❌
+   *
+   *   归属权益 20.18 ~ 21.84（极差 1.65，有波动）
+   *   账户权益 20.7519 ~ 20.7519（极差 0.0，完全不变）
+   * ```
+   *
+   * ## 根因
+   *
+   * `stats` 是**运行态摘要**：机器人停止后 `statsMap[traderId]` 为 `null`，
+   * 于是 `isDryRun = (stats?.dryRun === true)` 变成 `false` ⇒
+   * 曲线切到 `account` 口径（共享钱包真实权益，模拟盘从不触碰它）⇒ 一条平线。
+   *
+   * **「是不是模拟盘」是持久化属性，不该随运行状态翻转。**
+   */
+  const PAGE = readFileSync(new URL('./TraderPage.tsx', import.meta.url), 'utf8');
+
+  /*
+   * 判据一：`isDryRun` 必须由 `isPaperView(` 决定。
+   * 用位置比较：找到 `const isDryRun =` 之后 200 字符内必须有 `isPaperView`。
+   */
+  const idx = PAGE.indexOf('const isDryRun =');
+  assert.ok(idx > 0, '★ 应当能找到 `const isDryRun =`');
+  const window = PAGE.slice(idx, idx + 200);
+  assert.ok(
+    /isPaperView\(/.test(window),
+    '★ `isDryRun` 必须由 `isPaperView()` 决定 —— 只读 `stats.dryRun` 会让曲线在停止后切成账户口径（平线）',
+  );
+
+  /*
+   * 判据二：三级回落必须都传了。
+   * 少任何一级都会在某种状态下误判。
+   */
+  for (const key of ['runtimeDryRun', 'persistedDryRun', 'processDryRun']) {
+    assert.ok(
+      PAGE.includes(key),
+      `★ 必须传 ${key}（三级回落少一级就会在某种状态下误判）`,
+    );
+  }
+
+  /*
+   * 判据三：`curveMetric` 那一行必须由 `isDryRun`（三级回落）决定，
+   * **不能**直接看 `stats.dryRun`。
+   *
+   * ⚠️ 只查 `curveMetric` 附近，不全局禁止 `stats?.dryRun` ——
+   * 页头那两个徽章（「模拟模式 —— 不会真的下单」）的语义**确实**是
+   * "此刻在不在模拟模式下运行"，那是运行时事实，用 `stats.dryRun` 是对的。
+   * 差别在于：**曲线口径**是持久化属性（不该随运行状态翻转），
+   * 而**运行态徽章**恰恰要说运行状态。
+   */
+  const metricIdx = PAGE.indexOf('const curveMetric');
+  assert.ok(metricIdx > 0, '★ 应当能找到 `const curveMetric`');
+  const metricWindow = PAGE.slice(Math.max(0, metricIdx - 120), metricIdx + 120);
+  assert.ok(
+    /isDryRun \? 'attributed' : 'account'/.test(metricWindow),
+    '★ 曲线口径必须按 `isDryRun`（三级回落）选，不能直接看 stats.dryRun',
+  );
+});

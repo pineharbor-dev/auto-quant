@@ -920,7 +920,46 @@ export function TraderPage() {
    *
    * ⚠️ 标签也必须跟着换 —— 否则曲线画归属、却标着"账户权益"，那是新的谎。
    */
-  const isDryRun = stats?.dryRun === true;
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **必须用 `isPaperView()` 的三级回落，不能只读 `stats.dryRun`**
+   *      （2026-10-21 用户报告：机器人一停止，曲线就变成一条平线）
+   *
+   * ## 症状
+   *
+   * ```
+   *   #11（模拟盘）运行中 → 曲线有形状 ✅
+   *   点了「停止」       → 曲线变成一条平线 ❌
+   * ```
+   *
+   * ## 根因
+   *
+   * `stats` 是**运行态摘要** —— 机器人停止后 `statsMap[traderId]` 为 `null`
+   *（或者 `dryRun` 读不到），于是：
+   * ```
+   *   isDryRun = (stats?.dryRun === true) = false
+   *   curveMetric = 'account'          ← 切到了"共享钱包真实权益"
+   * ```
+   * 而模拟盘的交易**从不触碰真实钱包**（实测 `account_equity` 极差 0.0），
+   * 所以画出来必然是一条平线。
+   *
+   * **这条曲线不该因为机器人停止而改变口径** —— 停止只影响"还会不会继续交易"，
+   * 不影响"这个机器人是模拟盘还是实盘"（那是持久化属性）。
+   *
+   * ## 修法
+   *
+   * 用本文件里已有的 `isPaperView()`（三级回落）：
+   * ```
+   *   stats.dryRun（运行态）→ trader.dryRun（持久化）→ system.dryRun（进程级）
+   * ```
+   * 那与下面 `paper=` prop 用的是同一个函数 —— **同一屏上的同一个概念
+   * 只能有一个实现**（本文件自己的纪律）。
+   */
+  const isDryRun = isPaperView({
+    runtimeDryRun: stats?.dryRun,
+    persistedDryRun: trader?.dryRun,
+    processDryRun: system?.dryRun,
+  });
   const curveMetric: 'account' | 'attributed' = isDryRun ? 'attributed' : 'account';
   const windowAccountFirst = windowed[0]?.accountEquity ?? 0;
   /*
