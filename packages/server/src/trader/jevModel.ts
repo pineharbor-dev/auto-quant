@@ -723,8 +723,8 @@ export function buildState(
     const trendStrength = atrPercent > 0 ? deviationPercent / atrPercent : 0;
     const absStrength = Math.abs(trendStrength);
 
-    const strengthText =
-      absStrength < 0.5 ? '中性（贴着均线，方向不明）' : absStrength < 1.5 ? '温和' : '强';
+    /* 文字要读得通：中性时不能拼成「中性（…）趋势」这种。 */
+    const strengthText = absStrength < 0.5 ? '中性' : absStrength < 1.5 ? '温和趋势' : '强趋势';
     const directionText =
       absStrength < 0.5
         ? ''
@@ -735,8 +735,8 @@ export function buildState(
     lines.push(
       `EMA20 = ${c.ema20 < 1 ? c.ema20.toFixed(6) : c.ema20 < 100 ? c.ema20.toFixed(3) : c.ema20.toFixed(2)} —— ` +
         `价格在均线${deviationPercent >= 0 ? '上方' : '下方'} ${Math.abs(deviationPercent).toFixed(2)}%` +
-        `（= ${absStrength.toFixed(2)} 倍 ATR，${strengthText}趋势）` +
-        (directionText === '' ? '' : `：${directionText}`),
+        `（= ${absStrength.toFixed(2)} 倍 ATR，${strengthText}）` +
+        (directionText === '' ? '，方向不明 —— 不要假设有趋势' : `：${directionText}`),
     );
   }
 
