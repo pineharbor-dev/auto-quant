@@ -250,6 +250,72 @@ export const JEV_OPTIONS: readonly JevOptionSpec[] = [
     fallback: 'on',
   },
   {
+    key: 'drawdown_activation_percent',
+    label: '回撤守卫激活点',
+    why:
+      '浮盈达到这个百分比后，回撤守卫才开始盯着这个仓位。' +
+      '⚠️ **设得太小会让仓位刚有浮盈就被平掉** —— 实盘实测：' +
+      '设 0.4% 时，仓位浮盈 1.94% 后回落到亏损就被强平，' +
+      '而那些仓位本来有空间跑到止盈。' +
+      '设大一点（如 3%）才能让利润真正积累。',
+    kind: 'number',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  **从 0.4% 提到 3%**（2026-10-20 实盘数据驱动）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 实盘证据
+     *
+     * ```
+     *   13:05:55  最高浮盈 +1.94%，当前 -3.97%  ⇒ 回撤守卫平仓
+     *   12:35:30  最高浮盈 +2.86%，当前 +0.62%  ⇒ 回吐 78%，平仓
+     * ```
+     * 12 笔里 **4 笔是回撤守卫平的**，每笔亏 0.06–0.39 USDT。
+     * 那些仓位本来有空间跑到止盈（2:1 的目标是止损距离的两倍）。
+     *
+     * ## 为什么 0.4% 太小
+     *
+     * ```
+     *   0.4% 的激活点在 15 分钟周期里 = 一根 K 线的正常波动
+     *   ⇒ 几乎每个仓位都会立刻激活
+     *   ⇒ 然后任何回吐都触发平仓
+     *   ⇒ 止盈目标（止损距离×2）永远到不了
+     * ```
+     *
+     * ## 为什么改成 3%
+     *
+     * 与 `breakeven_trigger_percent` 默认值（5%）配合：
+     * ```
+     *   浮盈 3%  → 回撤守卫开始盯（允许回吐一半 = 1.5%）
+     *   浮盈 5%  → 移动止损移到保本
+     *   浮盈 = 止盈距离 → 止盈触发
+     * ```
+     * 三档之间有明确的层次，而不是全部挤在 1% 以内。
+     */
+    range: { min: 0, max: 20, step: 0.5, unit: '%' },
+    fallback: '3',
+  },
+  {
+    key: 'drawdown_giveback_ratio',
+    label: '允许回吐比例',
+    why:
+      '回撤守卫激活后，允许回吐峰值浮盈的百分之几。' +
+      '0.5 = 回吐一半就平仓；0.8 = 更宽容，让它多跑一会儿。' +
+      '⚠️ 太小会让正常波动触发平仓，太大则保护不了利润。',
+    kind: 'number',
+    /*
+     * ⚠️ **从 0.4 提到 0.5**（2026-10-20）。
+     *
+     * 实盘那笔「最高 +2.86% → 当前 +0.62%」回吐了 78%，
+     * 远超 40% 的上限 —— 说明 40% 在剧烈波动里根本来不及反应。
+     *
+     * 0.5 与 schema 默认值一致，是经过实盘检验的平衡点。
+     * 更小的值（如 0.3）会让"赚 1% 回吐 0.3% 就平"，那是在给交易所交手续费。
+     */
+    range: { min: 0.1, max: 1, step: 0.05, unit: '' },
+    fallback: '0.5',
+  },
+  {
     key: 'max_pump_percent',
     label: '追高上限',
     why:
@@ -767,6 +833,8 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_trailing: 'true',
       leverage_manual: '20',
       max_pump_percent: '20',
+      drawdown_activation_percent: '3',
+      drawdown_giveback_ratio: '0.5',
     },
   },
   {
@@ -795,6 +863,8 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_trailing: 'true',
       leverage_manual: '20',
       max_pump_percent: '30',
+      drawdown_activation_percent: '5',
+      drawdown_giveback_ratio: '0.6',
     },
   },
   {
@@ -823,6 +893,8 @@ export const JEV_PRESETS: readonly JevPreset[] = [
       allow_trailing: 'true',
       leverage_manual: '10',
       max_pump_percent: '10',
+      drawdown_activation_percent: '2',
+      drawdown_giveback_ratio: '0.4',
     },
   },
 ];

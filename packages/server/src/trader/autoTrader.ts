@@ -4800,6 +4800,7 @@ export class AutoTrader {
                */
               breakevenTriggerPercent: Math.max(0, jevNumber('breakeven_trigger_percent')),
               trailingStopPercent: Math.max(0, jevNumber('trailing_stop_percent')),
+              
             },
             /*
              * ⚠️ **开仓节流也来自 JEV 选项**（2026-10-19 用户要求）。
@@ -4815,6 +4816,39 @@ export class AutoTrader {
               ...config.throttle,
               maxEntriesPerCycle: Math.max(1, Math.floor(jevNumber('max_entries_per_cycle'))),
               maxEntriesPerHour: Math.max(1, Math.floor(jevNumber('max_entries_per_hour'))),
+            },
+            /*
+             * ⚠️⚠️ **回撤守卫必须可调**（2026-10-20 实盘数据驱动）。
+             *
+             * ## 为什么这个改动关键
+             *
+             * 12 笔平仓里 **4 笔是回撤守卫平的**：
+             * ```
+             *   13:05  最高浮盈 +1.94% → 当前 -3.97%  ⇒ 平仓，亏 0.39
+             *   12:35  最高浮盈 +2.86% → 当前 +0.62%  ⇒ 回吐 78%，平仓，亏 0.12
+             * ```
+             * 出厂值 `activationPercent: 0.4%` 意味着**几乎每个仓位立刻激活**，
+             * 之后任何回吐都触发平仓 ⇒ 止盈目标（止损距离×2）永远到不了。
+             *
+             * ## 三档配合（改完之后有层次）
+             *
+             * ```
+             *   浮盈 3% → 回撤守卫激活（允许回吐 50%）
+             *   浮盈 5% → 移动止损移到保本
+             *   浮盈 = 止盈距离 → 止盈触发
+             * ```
+             * 而不是全部挤在 1% 以内互相打架。
+             *
+             * ⚠️ **`drawdownGuard` 是 `StrategyConfig` 的顶层字段，不是
+             * `riskControl` 的子字段** —— 我第一次写进了 `riskControl`，
+             * tsc 直接拒了（`Property 'drawdownGuard' does not exist`）。
+             * 那个报错是有价值的：它挡住了"改了但没生效"的静默失败。
+             */
+            drawdownGuard: {
+              ...config.drawdownGuard,
+              enabled: true,
+              activationPercent: Math.max(0, jevNumber('drawdown_activation_percent')),
+              givebackRatio: Math.min(1, Math.max(0.05, jevNumber('drawdown_giveback_ratio'))),
             },
             /*
              * ⚠️ **单日亏损熔断阈值也来自 JEV 选项**（2026-10-19 用户要求）。
@@ -8888,7 +8922,11 @@ etPnlOf —— 见它的注释（资金费的符号）。 */
     const last = positionStore.lastBySymbol(this.deps.trader.id, symbol);
     if (last && last.leverage > 0) return last.leverage;
 
-    const risk = this.activeConfig.riskControl;
+    /*
+     * ⚠️ **用 `effectiveConfig()`**（2026-10-20，与回撤守卫/保本阈值同一批）。
+     * `activeConfig` 是装配期的原始配置，JEV 模式下它不是本轮生效的那份。
+     */
+    const risk = this.effectiveConfig().riskControl;
     return isMajorSymbol(symbol) ? risk.btcEthMaxLeverage : risk.altcoinMaxLeverage;
   }
 
@@ -8911,7 +8949,7 @@ etPnlOf —— 见它的注释（资金费的符号）。 */
    * 提前告诉模型，省掉一轮必然被拒的提案和那 10KB 的行情。
    */
   private annotateTradability(snaps: MarketSnapshot[], equity: number): void {
-    const rc = this.activeConfig.riskControl;
+    const rc = this.effectiveConfig().riskControl;
     for (const snap of snaps) {
       let minNotional = 0;
       try {
@@ -8974,7 +9012,28 @@ etPnlOf —— 见它的注释（资金费的符号）。 */
         unrealizedPnlPercent: live.unrealizedPnlPercent,
       };
 
-      const verdict = shouldCloseForDrawdown(view, this.activeConfig);
+      /*
+     * ⚠️⚠️ **必须传 `effectiveConfig()`，不是 `activeConfig`**（2026-10-20）。
+     *
+     * ## 为什么
+     *
+     * `effectiveConfig()` 是 JEV 覆盖之后的配置（回撤守卫的激活点与回吐比例
+     * 都在里面）。`activeConfig` 是装配期的原始配置 —— 用它意味着
+     * **用户在界面上把激活点从 0.4% 改成 3%，而这里仍然按 0.4% 判**。
+     *
+     * ## 这是同一类错误的第四次
+     *
+     * ```
+     *   ① 熔断阈值  → 覆盖写在 riskConfig，熔断读 config
+     *   ② 熔断横幅  → circuitBreakerReading 读 activeConfig
+     *   ③ 保本阈值  → applyBreakevenGuard 读 activeConfig
+     *   ④ 回撤守卫  → 就是这一处
+     * ```
+     * 根因是同一个：**"JEV 覆盖后的配置"没有一个所有人都用的入口**。
+     * `effectiveConfig()` 现在就是那个入口 —— 之后新增的机械保护方法
+     * 一律走它，不要再直接读 `activeConfig`。
+     */
+    const verdict = shouldCloseForDrawdown(view, this.effectiveConfig());
       if (!verdict.close) continue;
 
       this.emit('info', verdict.reason);
@@ -10340,7 +10399,8 @@ reduceQuantity: null,
     const adjustVerdict =
       adjustDecisions.length > 0
         ? this.risk.review(adjustDecisions, {
-            config: this.activeConfig,
+            /* ⚠️ 与主路径同一个源头 —— JEV 模式下必须用覆盖后的配置。 */
+            config: this.effectiveConfig(),
             account: {
               equity: input.account.equity,
               availableBalance: input.account.availableBalance,
@@ -12338,7 +12398,8 @@ reduceQuantity: null,
   /* ---------------------------------------------------------------------- */
 
   private isInCooldown(symbol: string): boolean {
-    const minutes = this.activeConfig.throttle.reentryCooldownMinutes;
+    /* ⚠️ 同上 —— 节流参数在 JEV 模式下也可能被覆盖。 */
+    const minutes = this.effectiveConfig().throttle.reentryCooldownMinutes;
     if (minutes <= 0) return false;
     const lastExit = tradeEvents.lastFor(this.deps.trader.id, symbol, 'exit');
     if (!lastExit) return false;

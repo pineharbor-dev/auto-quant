@@ -320,3 +320,55 @@ describe('JEV 追高过滤（2026-10-20 实盘事故后补）', () => {
     assert.equal(shouldFilter, false, '★ 阈值为 0 时不做任何过滤');
   });
 });
+
+describe('JEV 回撤守卫可配置（2026-10-20 实盘事故后补）', () => {
+  test('★★★ 回撤守卫的激活点与回吐比例必须可调', () => {
+    /*
+     * ## 实盘事故
+     *
+     * 12 笔平仓里 **4 笔是回撤守卫平的**：
+     * ```
+     *   13:05  最高浮盈 +1.94% → 当前 -3.97%  ⇒ 平仓，亏 0.39
+     *   12:35  最高浮盈 +2.86% → 当前 +0.62%  ⇒ 回吐 78%，平仓，亏 0.12
+     * ```
+     * 出厂值 `activationPercent: 0.4%` 意味着**几乎每个仓位立刻激活**，
+     * 之后任何回吐都触发平仓 ⇒ 止盈目标（止损距离×2）永远到不了。
+     */
+    const act = JEV_OPTIONS.find((c) => c.key === 'drawdown_activation_percent');
+    assert.ok(act !== undefined, '★ 必须有 drawdown_activation_percent');
+    if (act) {
+      assert.equal(act.kind, 'number');
+      assert.equal(act.fallback, '3', '★ 默认 3%（0.4% 太小，等于每仓立刻激活）');
+    }
+
+    const ratio = JEV_OPTIONS.find((c) => c.key === 'drawdown_giveback_ratio');
+    assert.ok(ratio !== undefined, '★ 必须有 drawdown_giveback_ratio');
+    if (ratio) {
+      assert.equal(ratio.kind, 'number');
+      assert.equal(ratio.fallback, '0.5', '★ 默认 0.5（与 schema 默认一致）');
+      assert.ok(
+        ratio.range !== undefined && ratio.range.min >= 0.05,
+        '★ 最小值不能是 0（回吐 0% 就平 = 刚赚就跑）',
+      );
+    }
+  });
+
+  test('★★★ 三档保护参数必须有层次（不能全挤在 1% 以内）', () => {
+    /*
+     * 改完之后的设计：
+     * ```
+     *   浮盈 3% → 回撤守卫激活（允许回吐 50%）
+     *   浮盈 5% → 移动止损移到保本
+     *   浮盈 = 止盈距离 → 止盈触发
+     * ```
+     * 这条测试钉住"层次"这个性质：
+     * **回撤激活点 < 保本触发点**，否则保本永远不会先发生。
+     */
+    const act = Number(JEV_OPTIONS.find((c) => c.key === 'drawdown_activation_percent')?.fallback);
+    const be = Number(JEV_OPTIONS.find((c) => c.key === 'breakeven_trigger_percent')?.fallback);
+    assert.ok(
+      act < be,
+      `★ 回撤激活点（${act}%）应早于保本触发点（${be}%），否则保本永不先发生`,
+    );
+  });
+});
