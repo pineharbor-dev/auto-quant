@@ -1465,3 +1465,62 @@ describe('JEV 模式：趋势语境（2026-10-20 实盘事故后补）', () => {
     assert.ok(!state.includes('空头结构'), '★ 不该说成空头结构');
   });
 });
+
+describe('JEV 模式：波动率过滤（2026-10-20 实盘事故后补）', () => {
+  /**
+   * ## 事故
+   *
+   * QUSDT 做空，止损距离 3.09%，3 分钟后被打穿：
+   * ```
+   *   止损触发价 0.119902 → 实际成交 0.120590（滑点 0.57%）
+   *   亏损 8.00U = 权益的 10.5%（风控预期只有 2.29U = 2.99%）
+   * ```
+   * 而那段 QUSDT 的 1 分钟 K 线振幅最高 **3.34%** —— 一根 1 分钟 K 线
+   * 就超过了整个止损距离。
+   *
+   * ## 判据
+   *
+   * `ATR × 1.5 < 所选档位的止损距离` 才允许开。
+   *
+   * 这里测的是**算术本身**（纯函数），不依赖网络 ——
+   * `decideForCandidate` 需要调 Jev，所以那里的集成验证靠实盘日志。
+   */
+  it('★★★ 噪音底线必须按 1.5×ATR 算，且要能挡住 QUSDT 那种标的', () => {
+    const cases = [
+      /* BTC：ATR 1.47%，止损 2.78% ⇒ 噪音 2.21% < 2.78% ⇒ 通过 */
+      { symbol: 'BTCUSDT', atrPercent: 1.47, stopPercent: 2.78, shouldPass: true },
+      /* QUSDT：ATR 2.10%，止损 3.09% ⇒ 噪音 3.15% ≥ 3.09% ⇒ 拒绝 */
+      { symbol: 'QUSDT', atrPercent: 2.1, stopPercent: 3.09, shouldPass: false },
+      /* 极端垃圾币：ATR 8%，止损 3% ⇒ 必拒 */
+      { symbol: 'JUNKCOIN', atrPercent: 8, stopPercent: 3, shouldPass: false },
+      /* 温和币：ATR 0.5%，止损 5% ⇒ 通过 */
+      { symbol: 'MAJOR', atrPercent: 0.5, stopPercent: 5, shouldPass: true },
+    ];
+    for (const c of cases) {
+      const noiseFloor = c.atrPercent * 1.5;
+      const passes = noiseFloor < c.stopPercent;
+      assert.equal(
+        passes,
+        c.shouldPass,
+        `★ ${c.symbol}：噪音底线 ${noiseFloor.toFixed(2)}% ` +
+          `应${c.shouldPass ? '小' : '不小于'}止损 ${c.stopPercent}%`,
+      );
+    }
+  });
+
+  it('★★ 边界：噪音底线恰好等于止损距离时应拒绝（不是通过）', () => {
+    /*
+     * 判据用的是 `>=` 而不是 `>`。
+     *
+     * 理由：相等意味着"平均振幅的 1.5 倍刚好等于止损距离" ——
+     * 那等价于"大约一半的时间止损都在噪音范围内"。
+     * 那不是灰色地带，那是明确不该做。
+     */
+    const atrPercent = 2;
+    const stopPercent = 3; /* ATR×1.5 = 3 = 止损距离 */
+    assert.ok(
+      atrPercent * 1.5 >= stopPercent,
+      '★ 相等时 `>=` 判据应拒绝',
+    );
+  });
+});

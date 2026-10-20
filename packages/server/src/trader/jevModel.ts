@@ -1620,6 +1620,59 @@ export async function decideForCandidate(
   const sizeTier = asTier(answers.size_tier?.choice);
   const stopTier = asTier(answers.stop_tier?.choice);
   const takeTier = asTier(answers.take_tier?.choice);
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  **波动率过滤：止损距离必须显著大于分钟级噪音**（2026-10-20 实盘抓到）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故
+   *
+   * ```
+   *   QUSDT 做空，止损距离 3.09%
+   *   3 分钟后止损被打穿，实际成交价偏离止损价 0.57%
+   *   亏损 8.00U = 权益的 10.5%（风控预期只有 2.29U = 2.99%）
+   * ```
+   * 而那一时段 QUSDT 的 1 分钟 K 线振幅最高 **3.34%** ——
+   * **一根 1 分钟 K 线就超过了整个止损距离**，止损在一个 tick 内被跳过，
+   * 成交在更差的价格上。
+   *
+   * ## 判据
+   *
+   * ```
+   *   ATR（既是噪音尺度） × 1.5  <  该档止损距离   ⇒ 才允许开
+   * ```
+   * `c.atr` 是调用方给的 ATR（15 分钟口径）。乘 1.5 是因为：
+   * **一根 ATR 是平均振幅，而止损要能容忍"平均的 1.5 倍"这种常见波动**，
+   * 否则一半以上的时间止损都在噪音里。
+   *
+   * ⚠️ **只拒绝，不缩小仓位**：把仓位改小并不能解决"止损被跳过"这个问题 ——
+   * 滑点照样发生，只是绝对金额小一点。治本是不做那个标的。
+   *
+   * ⚠️ **实测通过率**（2026-10-20 的行情）：
+   * ```
+   *   BTC  ATR 1.47% × 1.5 = 2.21%  vs 止损 2.78%（B档）  ⇒ 通过
+   *   GTC  ATR 1.65% × 1.5 = 2.48%  vs 止损 2.48%（B档）  ⇒ 刚好通过
+   *   QUSDT ATR 2.10% × 1.5 = 3.15% vs 止损 3.09%（B档）  ⇒ **拒绝** ✅
+   * ```
+   * 它挡掉的正是那种"止损几乎必然被噪音打掉"的标的，而不是所有高波动币。
+   */
+  if (stopTier !== null) {
+    const chosenStopDistance = Math.abs(tiers.stop[stopTier] - c.price);
+    const stopDistancePercent = (chosenStopDistance / c.price) * 100;
+    const noiseFloorPercent = ((c.atr * 1.5) / c.price) * 100;
+    if (noiseFloorPercent >= stopDistancePercent) {
+      return {
+        decision: null,
+        outcome: 'skip',
+        detail:
+          `波动过滤：${c.symbol} 的 ATR ${(c.atr / c.price * 100).toFixed(2)}%` +
+          `（噪音底线 ${noiseFloorPercent.toFixed(2)}%，按 1.5×ATR 算）` +
+          `已不小于所选档位的止损距离 ${stopDistancePercent.toFixed(2)}% —— ` +
+          '止损会在噪音里被打掉，不做',
+      };
+    }
+  }
   /*
    * ══════════════════════════════════════════════════════════════════════════
    *  ⚠️⚠️ **止盈档必须跟止损档同档**（2026-10-19 用户截图抓到的设计 bug）
