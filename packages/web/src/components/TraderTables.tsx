@@ -2662,8 +2662,38 @@ export function TraderTables({
     tab,
   );
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **「全部平仓」按钮的可用性要看【表格里的行】，不是外部的 `positionCount`**
+   *      （2026-10-21 用户报告：按钮变灰点不了，而表里有 4 个持仓）
+   *
+   * ## 症状
+   *
+   * ```
+   *   页签显示「当前持仓 0」
+   *   表里明明有 4 行（SOLUSDT / ZECUSDT / DOGEUSDT / HYPEUSDT）
+   *   「全部平仓」按钮 disabled ⇒ 操作员点不了
+   * ```
+   *
+   * ## 根因
+   *
+   * `positionCount` 是**页面从 WebSocket 事件里算的**（见 `TraderPage` 里那条注释），
+   * 它有自己的更新节奏；而表格渲染用的是 `positions`（`/account` 的实时读数）。
+   * 两者在"机器人刚停止、WS 不再推送"时会**永久分叉** ——
+   * 而机器人停止恰恰是操作员最想点「全部平仓」的时刻。
+   *
+   * ## 修法
+   *
+   * 判据用 `positions.length`（**屏幕上真实渲染的那份**）。
+   * 那是操作员眼睛看到的东西 —— 按钮该跟它一致，而不是跟一个看不见的计数一致。
+   *
+   * ⚠️ `positions` 是可选 prop（老调用点可能不传）：缺失时回落到 `positionCount`，
+   * 保证既有行为不变。
+   */
+  const closableCount = positions?.length ?? positionCount;
+
   const tabs: Array<{ id: TraderTabId; label: string; count?: number }> = [
-    { id: 'positions', label: '当前持仓', count: positionCount },
+    { id: 'positions', label: '当前持仓', count: closableCount },
     // 与表格同一个数组，见上面 `ordersPaging` 的说明。
     { id: 'orders', label: '当前委托', count: openOrders.length },
     { id: 'trades', label: '历史成交' },
@@ -2701,8 +2731,8 @@ export function TraderTables({
           <Button
             size="sm"
             variant="danger"
-            disabled={positionCount === 0}
-            title={positionCount === 0 ? '当前没有持仓' : '查看手工平仓的说明'}
+            disabled={closableCount === 0}
+            title={closableCount === 0 ? '当前没有持仓' : '查看手工平仓的说明'}
             onClick={() => setCloseTarget('__all__')}
           >
             全部平仓
