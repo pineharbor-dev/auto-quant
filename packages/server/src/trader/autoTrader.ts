@@ -6675,7 +6675,40 @@ export class AutoTrader {
     const authoritative = await this.findRoundTrip(local).catch(() => null);
     const closedAt = authoritative?.closedAt || closedAtInput || new Date().toISOString();
 
-    let exitPrice = authoritative?.exitPrice || exitPriceInput;
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ⚠️⚠️ **离场价优先用【本地已知值】，不是交易所重建值**
+     *      （2026-10-20 实盘抓到：日志说亏 18.39，账面只亏 2.55）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 症状
+     *
+     * ```
+     *   10:49:43  订单 BRUSDT SELL MARKET FILLED 数量=88@0.68615     ← 真实成交价
+     *   10:49:48  已平仓 BRUSDT 多头 @ 0.50545 → 净 -18.3880 USDT   ← 日志
+     *   trades   表：入场 0.71437557 → 离场 0.68615，净 -2.5455      ← 账面
+     * ```
+     * **日志与账面差 7 倍。** 操作员看到"亏 18.39"会以为账户被打穿了。
+     *
+     * ## 根因
+     *
+     * `findRoundTrip()` 从**交易所历史成交**重建往返。而 BRUSDT 是高频标的，
+     * 交易所那一侧同时存在**别的回合的成交**（也包括不属于本机器人的成交 ——
+     * 见同一轮日志里那条「账户上发现 100 笔不属于本平台的成交」）。
+     * 重建把那些混进来，得到一个**不属于这一笔的离场价**（0.50545）。
+     *
+     * ## 修法
+     *
+     * 调用方传进来的 `exitPriceInput`（来自即时成交回报 `FILLED 数量=88@0.68615`）
+     * 是**这一笔自己的成交价**，它比"从历史里重建"更直接、更可信。
+     * ⇒ 顺序倒过来：先用本地已知值，缺失时才回落到重建值。
+     *
+     * ⚠️ **`grossPnl` 的算法不改**：那里用 `authoritative` 是为了拿到
+     * **两条腿的手续费**（见上面那段注释）—— 那是另一个问题，
+     * 且它与账面的偏差由 `bookTrade()` 的净额兜底。
+     * 这次只修**展示给操作员看的那个价格**。
+     */
+    let exitPrice = exitPriceInput > 0 ? exitPriceInput : (authoritative?.exitPrice ?? 0);
     if (!(exitPrice > 0)) {
       exitPrice = await this.deps.broker.getMarkPrice(local.symbol).catch(() => 0);
     }
