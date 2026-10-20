@@ -130,3 +130,67 @@ test('★★★ 自检循环必须【启动时立即跑一次】（`setInterval`
     '★ 必须在注册定时器之后【立即】触发一次 sweep（否则要等一整个间隔）',
   );
 });
+
+/* -------------------------------------------------------------------------- */
+/*  手工平仓必须同时结清本地挂单记录（2026-10-21 用户报告的 BUG）                  */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 手工平仓必须结清本地挂单记录（否则界面留幽灵委托）', () => {
+  /*
+   * ## 用户原话
+   *
+   * > 「JEV实盘我停了，然后手动点了全部平仓，仓位好像平了，
+   * >  但是当前委托里面为什么还有」
+   *
+   * ## 实测
+   *
+   * 那 6 张单在交易所侧**全是 `CANCELED`**（它们是 `closePosition` 条件单，
+   * 仓位一平交易所就自动撤销），而本地 `orders` 表仍然停在 `NEW`。
+   *
+   * ## 为什么上一版的 `settleStaleOrders` 没救到它
+   *
+   * 那条清理挂在**决策周期/自检循环**里 —— 而这次是
+   * 「先停机器人、再手工平仓」，两个循环都没机会跑。
+   * ⇒ 平仓路径必须**自己**立即清账。
+   */
+  const closeManually = /async closeManually\(symbol: string\)[\s\S]*?\n  \}/.exec(AUTO);
+  assert.ok(closeManually !== null, '★ 应当能找到 closeManually');
+  assert.ok(
+    /orderStore\.cancelOpenBySymbol\(traderId, symbol\)/.test(closeManually![0]),
+    '★ 手工平仓里必须结清本地挂单 —— 不能只撤交易所侧（那样界面会留幽灵委托）',
+  );
+
+  /*
+   * ⚠️ **必须只在撤单成功时清**。
+   *
+   * 撤单失败意味着挂单可能还在交易所侧，那时清掉本地记录会让操作员
+   * 以为"没有挂单了" —— 比留着更危险。所以判据是"有一个 cancelFailed
+   * 标记，且清账被它守住"。
+   */
+  assert.ok(
+    /let cancelFailed = false/.test(closeManually![0]),
+    '★ 必须记录撤单是否失败',
+  );
+  assert.ok(
+    /if \(!cancelFailed\) \{[\s\S]*?cancelOpenBySymbol/.test(closeManually![0]),
+    '★ 清账必须被 `if (!cancelFailed)` 守住（撤单失败时不能清）',
+  );
+});
+
+test('★★★ cancelOpenBySymbol 只动 NEW，不改写历史状态', () => {
+  /*
+   * 已成交（`FILLED`）与早已撤销的行是**历史事实**，不能改写。
+   * 判据：SQL 里必须有 `status = 'NEW'` 这个条件。
+   */
+  const REPO = readFileSync(new URL('../store/repositories.ts', import.meta.url), 'utf8');
+  const fn = /cancelOpenBySymbol\(traderId: number, symbol: string\)[\s\S]*?\n  \},/.exec(REPO);
+  assert.ok(fn !== null, '★ 应当能找到 cancelOpenBySymbol');
+  assert.ok(
+    /status = 'NEW'/.test(fn![0]),
+    '★ UPDATE 必须限定 `status = \'NEW\'` —— 否则会改写已成交的历史行',
+  );
+  assert.ok(
+    /status = 'CANCELED'/.test(fn![0]),
+    '★ 应当写成 CANCELED（与交易所侧一致）',
+  );
+});

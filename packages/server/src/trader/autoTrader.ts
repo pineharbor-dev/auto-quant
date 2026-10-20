@@ -12259,16 +12259,56 @@ reduceQuantity: null,
     if (!local) return null;
 
     // ① 先撤单 —— 这一条不能颠倒，见上面的说明。
+    let cancelFailed = false;
     await this.deps.broker.cancelAllOrders(symbol).catch((error) => {
       /*
        * 撤单失败**不阻断平仓**：一个撤不掉的保护单是麻烦，
        * 而一个平不掉的亏损仓位是危险。**两害相权，先平。**
        */
+      cancelFailed = true;
       this.emit(
         'warn',
         `${symbol} 手工平仓前撤单失败（${(error as Error).message}），仍然继续平仓。`,
       );
     });
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ①' **本地也要清账**（2026-10-21 用户报告的 BUG）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 用户原话
+     *
+     * > 「JEV实盘我停了，然后手动点了全部平仓，仓位好像平了，
+     * >  但是当前委托里面为什么还有」
+     *
+     * ## 实测
+     *
+     * 那 6 张单在交易所侧**全是 `CANCELED`**（它们是 `closePosition` 条件单，
+     * 仓位一平交易所就自动撤销），而本地 `orders` 表仍然停在 `NEW`
+     * ⇒ 界面「当前委托」显示幽灵单。
+     *
+     * ## 根因
+     *
+     * 上面那一步撤了**交易所侧**，但没有任何一步回写本地 `orders` 表。
+     * 正常轮次里的对账（`settleStaleOrders`）会清理这类残留 ——
+     * **可它只在机器人运行时跑**，而这次是「先停机器人、再手工平仓」，
+     * 对账没有机会执行。
+     *
+     * ⇒ 平仓路径必须**立即**清账，不能指望下一轮对账。
+     *
+     * ⚠️ **只在撤单成功时清**：撤单失败意味着挂单可能还在交易所侧，
+     * 那时清掉本地记录会让操作员以为"没有挂单了" —— 比留着更危险。
+     */
+    if (!cancelFailed) {
+      const cleared = orderStore.cancelOpenBySymbol(traderId, symbol);
+      if (cleared > 0) {
+        this.emit(
+          'info',
+          `${symbol} 手工平仓：已一并结清 ${cleared} 张本地挂单记录（交易所侧已撤销）。`,
+        );
+      }
+    }
 
     // ② 市价平仓。
     const exitSide: 'BUY' | 'SELL' = local.side === 'long' ? 'SELL' : 'BUY';

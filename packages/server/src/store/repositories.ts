@@ -1573,6 +1573,40 @@ export const orders = {
    * ⚠️ 只返回**保护单**类型（止损/止盈），不含入场单 ——
    * 调用方问的是"有没有保护"，入场单不是保护。
    */
+  /**
+   * **把某标的还挂着的单标记为已撤销**（2026-10-21 实盘抓到）。
+   *
+   * ## 为什么需要它
+   *
+   * 用户报告：「JEV实盘我停了，然后手动点了全部平仓，仓位好像平了，
+   * 但是当前委托里面为什么还有」。
+   *
+   * 实测那 6 张单在交易所侧**全是 `CANCELED`**（条件单是
+   * `closePosition` 类型，仓位一平交易所就自动撤销它们），
+   * 而本地 `orders` 表仍然停在 `NEW` ⇒ 界面的「当前委托」显示幽灵单。
+   *
+   * ## 根因
+   *
+   * `closeManually()` 调了 `broker.cancelAllOrders(symbol)` 撤**交易所侧**，
+   * 但没有任何一步回写本地 `orders` 表。而正常轮次里的对账
+   * （`settleStaleOrders`）会清理这类残留 —— **可它只在机器人运行时跑**，
+   * 而这次是「先停机器人、再手工平仓」，对账没有机会执行。
+   *
+   * ⇒ 平仓路径必须**立即**清账，而不是指望下一轮对账。
+   *
+   * ⚠️ 只动 `status='NEW'` 的行：已成交（`FILLED`）与早已撤销的行
+   * 是历史事实，不能改写。
+   */
+  cancelOpenBySymbol(traderId: number, symbol: string): number {
+    const result = getDb().run(
+      `UPDATE orders SET status = 'CANCELED'
+        WHERE trader_id = ? AND symbol = ? AND status = 'NEW'`,
+      traderId,
+      symbol,
+    );
+    return Number(result.changes ?? 0);
+  },
+
   openProtectionTypes(traderId: number, symbol: string): string[] {
     const rows = getDb().all<{ type: string }>(
       `SELECT type FROM orders
