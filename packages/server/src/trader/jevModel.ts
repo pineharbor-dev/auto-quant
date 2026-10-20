@@ -672,21 +672,71 @@ export function buildState(
       c.rsi7 >= 70 ? '（超买区，追多风险大）' : c.rsi7 <= 30 ? '（超卖区，追空风险大）' : '';
     lines.push(`RSI7 = ${c.rsi7.toFixed(1)}${rsiNote}`);
   }
-  if (c.ema20 !== undefined && c.ema20 > 0) {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **趋势判断必须用 ATR 归一化，不能用固定百分比阈值**
+   *      （2026-10-20 第二次修正：第一版用 0.1% 固定阈值是错的）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么 0.1% 这种固定阈值不可用
+   *
+   * 同一时刻实测各标的「价格 - EMA20」偏离：
+   * ```
+   *   BTCUSDT    -0.10%   （ATR 0.19%）
+   *   ETHUSDT    -0.18%   （ATR 0.30%）
+   *   SOLUSDT    -0.16%   （ATR 0.32%）
+   *   PHAUSDT    -2.48%   （ATR 2.08%）
+   *   JCTUSDT   +21.60%   （ATR 6.18%）
+   * ```
+   * **主流币的偏离天然就小**（价格紧贴均线，那是它们"有效"的表现），
+   * 而垃圾币随便就偏离 20%。一个固定的 0.1% 阈值对前者是"刚跨过线"、
+   * 对后者是"差了两个数量级" —— **两者根本不可比**。
+   *
+   * ## 修法：除以 ATR
+   *
+   * ```
+   *   标准化强度 = (价格 - EMA20) / ATR
+   *
+   *   BTC:  -0.10% / 0.19% = -0.53  （弱）
+   *   ETH:  -0.18% / 0.30% = -0.60  （弱）
+   *   PHA:  -2.48% / 2.08% = -1.19  （中）
+   *   JCT:  +21.6% / 6.18% = +3.49  （强）
+   * ```
+   * 这才是可比的量。而且它有一个直观含义：
+   * **"价格偏离均线多少个 ATR"** —— `±1 ATR` 是常见的，`±3 ATR` 是极端。
+   *
+   * ## 三档判据
+   *
+   * ```
+   *   |强度| < 0.5  → 中性（贴着均线，方向不明 —— 不要假装看得出趋势）
+   *   0.5 ≤ 强度 < 1.5 → 温和多头/空头
+   *   强度 ≥ 1.5      → 强多头/空头
+   * ```
+   * ⚠️ **中性档必须保守**：这个模式的底线是"宁可少做，不要假装有信号"。
+   * 上一版把 -0.15% 判成"空头结构"就是过度解读 —— 那点偏离在
+   * BTC 的 ATR（0.19%）里还不到 1 个 ATR。
+   */
+  if (c.ema20 !== undefined && c.ema20 > 0 && c.atr > 0) {
     const deviationPercent = ((c.price - c.ema20) / c.ema20) * 100;
-    /*
-     * 结构判定。阈值 0.1% 是为了滤掉"贴着均线"的噪声 ——
-     * 那种情况说成"多头/空头结构"是过度解读。
-     */
-    const structure =
-      Math.abs(deviationPercent) < 0.1
-        ? '贴近均线（中性，方向不明）'
+    /* 标准化趋势强度：偏离了几个 ATR。 */
+    const atrPercent = (c.atr / c.price) * 100;
+    const trendStrength = atrPercent > 0 ? deviationPercent / atrPercent : 0;
+    const absStrength = Math.abs(trendStrength);
+
+    const strengthText =
+      absStrength < 0.5 ? '中性（贴着均线，方向不明）' : absStrength < 1.5 ? '温和' : '强';
+    const directionText =
+      absStrength < 0.5
+        ? ''
         : deviationPercent > 0
-          ? '多头结构（顺势做多、做空为逆势）'
-          : '空头结构（顺势做空、做多为逆势）';
+          ? '多头结构（顺势做多；做空是逆势）'
+          : '空头结构（顺势做空；做多是逆势）';
+
     lines.push(
-      `EMA20 = ${c.ema20 < 1 ? c.ema20.toFixed(6) : c.ema20 < 100 ? c.ema20.toFixed(3) : c.ema20.toFixed(2)} —— 价格在均线${deviationPercent >= 0 ? '上方' : '下方'} ` +
-        `${Math.abs(deviationPercent).toFixed(2)}%，${structure}`,
+      `EMA20 = ${c.ema20 < 1 ? c.ema20.toFixed(6) : c.ema20 < 100 ? c.ema20.toFixed(3) : c.ema20.toFixed(2)} —— ` +
+        `价格在均线${deviationPercent >= 0 ? '上方' : '下方'} ${Math.abs(deviationPercent).toFixed(2)}%` +
+        `（= ${absStrength.toFixed(2)} 倍 ATR，${strengthText}趋势）` +
+        (directionText === '' ? '' : `：${directionText}`),
     );
   }
 

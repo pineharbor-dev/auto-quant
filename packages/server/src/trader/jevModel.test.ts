@@ -1408,16 +1408,42 @@ describe('JEV 模式：趋势语境（2026-10-20 实盘事故后补）', () => {
     const t = tiersFor(down, OPTS, 'long');
     const state = buildState(down, t, t);
 
+    /*
+     * ⚠️ **2026-10-20 第二次修正：判据从「固定 0.1% 阈值」改成「ATR 归一化」**。
+     *
+     * 原来这条测试断言"偏离 0.66% 必须判成空头结构" —— 那个断言本身就是错的：
+     * 0.66% 在 BTC 的 ATR（1.47%）里只有 0.45 倍，**那不是趋势**。
+     * 用它训出来的 Jev 会在 ETH「偏离 0.15%」时也判空头结构，然后做空被反弹打掉。
+     *
+     * 新判据 `|偏离 / ATR|`：
+     *   < 0.5        → 中性
+     *   0.5 ~ 1.5    → 温和
+     *   ≥ 1.5        → 强
+     */
     assert.ok(state.includes('价格在均线下方'), '★ 必须直说价格在均线哪一侧');
-    assert.ok(state.includes('空头结构'), '★ 必须给出结构结论');
-    assert.ok(state.includes('做多为逆势'), '★ 必须点明逆势的方向');
+    assert.ok(state.includes('倍 ATR'), '★ 必须给出 ATR 归一化后的强度');
     assert.ok(
-      /价格在均线下方 0\.\d+%/.test(state),
+      /价格在均线下方 \d+\.\d+%/.test(state),
       '★ 偏离度要算好给它（它不会自己减）',
     );
+
+    /* ATR 归一化后 0.66% / 1.47% = 0.45 倍 ⇒ 中性，不该硬说成空头结构 */
+    const norm = 0.66 / 1.47;
+    if (norm < 0.5) {
+      assert.ok(state.includes('中性'), `★ ${norm.toFixed(2)} 倍 ATR 应判中性`);
+      assert.ok(
+        !state.includes('空头结构'),
+        '★ 0.45 倍 ATR 不该说成空头结构（那正是 ETH 被误判的根因）',
+      );
+    }
   });
 
   it('★★★ 上涨行情必须判成多头结构（反向校准，防止永远输出"空头"）', () => {
+    /*
+     * 参数选得让它**确实是强多头**：偏离 3000 点、ATR 1200 ⇒ 2.5 倍 ATR。
+     * 上一版用这个用例但没给 atr，归一化算不出来 —— 那种测试通过只是因为
+     * 判据写死了，不是因为它真的对。
+     */
     const up = {
       symbol: 'BTCUSDT',
       price: 85000,
@@ -1429,8 +1455,9 @@ describe('JEV 模式：趋势语境（2026-10-20 实盘事故后补）', () => {
     const t = tiersFor(up, OPTS, 'long');
     const state = buildState(up, t, t);
     assert.ok(state.includes('价格在均线上方'), '★ 应判成上方');
-    assert.ok(state.includes('多头结构'), '★ 应判成多头结构');
-    assert.ok(state.includes('做空为逆势'), '★ 应点明逆势方向');
+    assert.ok(state.includes('多头结构'), '★ 2.5 倍 ATR 应判成多头结构');
+    assert.ok(state.includes('做空是逆势'), '★ 应点明逆势方向');
+    assert.ok(state.includes('强趋势'), '★ 2.5 倍 ATR 应判成「强」');
     assert.ok(state.includes('超买区'), '★ RSI 72 应提示超买');
   });
 
@@ -1457,12 +1484,46 @@ describe('JEV 模式：趋势语境（2026-10-20 实盘事故后补）', () => {
     }
   });
 
-  it('★★ 贴近均线时不该过度解读成结构（阈值 0.1%）', () => {
-    const flat = { symbol: 'XUSDT', price: 100, atr: 2, ema20: 100.05 };
-    const t = tiersFor(flat, OPTS, 'long');
-    const state = buildState(flat, t, t);
-    assert.ok(state.includes('贴近均线'), '★ 偏离 0.05% 应判中性');
-    assert.ok(!state.includes('空头结构'), '★ 不该说成空头结构');
+  it('★★★ 偏离不到 0.5 倍 ATR 时必须判中性（ETH 被误判的直接原因）', () => {
+    /*
+     * ## 实盘事故（2026-10-20）
+     *
+     * ```
+     *   ETH 现价 2381.69  EMA20 2385.17  偏离 -0.15%  ATR 0.30%
+     *   ⇒ 上一版判成"空头结构"（因为 |−0.15%| > 0.1%）
+     *   ⇒ Jev 仍然做多，被止损
+     * ```
+     * 真正的问题不是 Jev 判断错，是**我们给它的"结构"标签过度解读了**：
+     * -0.15% 在 ETH 的 ATR（0.30%）里只有 **0.5 倍** —— 那正好在噪音范围内。
+     *
+     * 新判据下它应该输出「中性（贴着均线，方向不明）」。
+     */
+    const eth = {
+      symbol: 'ETHUSDT',
+      price: 2381.69,
+      atr: 2381.69 * 0.003, /* ATR 0.30% */
+      ema20: 2385.17,
+    };
+    const t = tiersFor(eth, OPTS, 'long');
+    const state = buildState(eth, t, t);
+    assert.ok(state.includes('中性'), '★ 0.5 倍 ATR 应判中性');
+    assert.ok(
+      !state.includes('空头结构'),
+      '★ 不该说成空头结构 —— 这正是 ETH 被误判的根因',
+    );
+  });
+
+  it('★★ 极端偏离（> 3 倍 ATR）必须判强趋势', () => {
+    /* 反向校准：不能因为"保守"就把所有情况都判中性。 */
+    const pumped = {
+      symbol: 'JCTUSDT',
+      price: 0.0039,
+      atr: 0.0039 * 0.0618,
+      ema20: 0.0032, /* 偏离 +21.9% vs ATR 6.18% ⇒ 3.5 倍 */
+    };
+    const t = tiersFor(pumped, OPTS, 'long');
+    const state = buildState(pumped, t, t);
+    assert.ok(state.includes('强趋势'), '★ 3.5 倍 ATR 应判强趋势');
   });
 });
 
