@@ -60,6 +60,19 @@ import type {
  * 与 `ControlSwitch` 的区别：那个是**布尔开关**（整个团队共享），
  * 这个有枚举/数字类型，且只影响 `mode === 'jev'` 的机器人。
  */
+/**
+ * **JEV 参数预设**（2026-10-20 用户要求）。
+ *
+ * 一组自洽的参数，一键套用。为什么需要它：JEV 的 16 个参数是**互相耦合**的
+ * （risk_percent 调大会更快用完 max_margin_usage，min_rr 调大会降低胜率），
+ * 逐个调很容易调出一组自相矛盾的配置。
+ */
+export interface JevPreset {
+  id: string;
+  label: string;
+  summary: string;
+}
+
 export interface JevOption {
   key: string;
   label: string;
@@ -1159,9 +1172,23 @@ export const api = {
       body: { on },
     }),
 
-  /** 读 JEV 模式的全部可调选项。 */
+  /**
+   * 读 JEV 模式的全部可调选项（含可一键套用的预设）。
+   *
+   * 预设与选项**同一个响应**返回 —— 它们是一份数据的两面，
+   * 分成两次往返会让"按钮已渲染但预设还没到"的错位发生。
+   */
   traderJevOptions: (id: number, signal?: AbortSignal) =>
-    request<{ options: JevOption[] }>(`/traders/${id}/jev-options`, { signal }),
+    request<{ options: JevOption[]; presets: JevPreset[] }>(`/traders/${id}/jev-options`, {
+      signal,
+    }),
+
+  /** 一键套用一个 JEV 参数预设（一次写入整组，服务端原子应用）。 */
+  applyTraderJevPreset: (id: number, presetId: string) =>
+    request<{ applied: number; options: JevOption[] }>(
+      `/traders/${id}/jev-presets/${presetId}`,
+      { method: 'POST' },
+    ),
 
   /** 改一个 JEV 选项。返回回读后的全表。 */
   setTraderJevOption: (id: number, key: string, value: string) =>

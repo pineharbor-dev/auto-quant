@@ -12,6 +12,8 @@ import {
   setJevOption,
   setSwitch,
   switchSpec,
+  JEV_PRESETS,
+  applyJevPreset,
 } from '../trader/control.js';
 import {
   EXCHANGES,
@@ -3366,7 +3368,43 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    */
   app.get('/api/traders/:id/jev-options', authed, (request) => {
     idOf(request);
-    return { options: listJevOptions() };
+    return {
+      options: listJevOptions(),
+      /*
+       * 预设也随这个响应一起发。
+       *
+       * ⚠️ **不单开一个 `/jev-presets` 端点**：预设是"把这批选项设成某一组值"，
+       * 它与选项本身是同一份数据的两面。分成两个端点会让前端需要两次往返，
+       * 而且两边的加载顺序可能错位（先渲染出按钮、点下去时预设还没到）。
+       */
+      presets: JEV_PRESETS,
+    };
+  });
+
+  /**
+   * **应用一个 JEV 参数预设**（一键套用）。
+   *
+   * 用户原话（2026-10-20）：
+   * > 「增加一个预设模式，把你觉得最能挣钱得参数 设置一个内置预设，
+   * >  以后可以一键快速设置」
+   *
+   * ## 为什么是一个 POST 而不是 16 次 `/jev-options/:key`
+   *
+   * 16 个参数是**一组自洽的配置**。逐条 PATCH 的话中途失败会留下
+   * "一半新一半旧"的状态，而那个状态可能自相矛盾
+   *（例如 `max_positions` 已改成 8 而 `max_margin_usage` 还是 80%）。
+   * 一次调用、服务端原子写入，要么全成要么全不动。
+   */
+  app.post('/api/traders/:id/jev-presets/:presetId', authed, async (request, reply) => {
+    idOf(request);
+    const presetId = String((request.params as { presetId: string }).presetId);
+    const result = applyJevPreset(presetId);
+    if (result.unknown.length > 0) {
+      return reply.code(400).send({
+        error: `预设「${presetId}」有非法参数：${result.unknown.join('、')}`,
+      });
+    }
+    return { applied: result.applied, options: listJevOptions() };
   });
 
   app.post('/api/traders/:id/jev-options/:key', authed, async (request, reply) => {

@@ -23,7 +23,11 @@ import { after, beforeEach, describe, test } from 'node:test';
 
 import { closeDb, initDb } from '../db/index.js';
 import {
+  JEV_OPTIONS,
+  JEV_PRESETS,
   RUNTIME_SWITCHES,
+  applyJevPreset,
+  getJevOption,
   isSwitchOn,
   listSwitches,
   setSwitch,
@@ -148,5 +152,107 @@ describe('运行期开关中心', () => {
       /* key 必须是稳定的机器码（持久化契约，改名等于丢掉操作员的选择）。 */
       assert.match(spec.key, /^[a-z][a-z_]*$/, `★ ${spec.key} 必须是小写机器码`);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/*  JEV 参数预设（2026-10-20 用户要求）                                          */
+/* -------------------------------------------------------------------------- */
+
+describe('JEV 参数预设', () => {
+  test('★★★ 每个预设里的每个键都必须存在于 JEV_OPTIONS 且值合法', () => {
+    /*
+     * ## 为什么这条必须在测试里红
+     *
+     * `applyJevPreset()` 运行时**已经**会校验并拒绝非法值（原子性：
+     * 一个非法就一个都不写）。但那样一来，操作员点"套用"只会看到
+     * 一个 400 错误 —— 而预设是我们自己写的，写错了应该在 CI 里就发现。
+     *
+     * 这条测试盯的就是"我们自己写错的预设"。
+     */
+    const specs = new Map(JEV_OPTIONS.map((spec) => [spec.key, spec]));
+    for (const preset of JEV_PRESETS) {
+      for (const [key, value] of Object.entries(preset.values)) {
+        const spec = specs.get(key);
+        assert.ok(spec !== undefined, `★ 预设「${preset.id}」引用了不存在的键：${key}`);
+        if (spec === undefined) continue;
+
+        if (spec.kind === 'enum') {
+          const allowed = (spec.options ?? []).map((option) => option.value);
+          assert.ok(
+            allowed.includes(value),
+            `★ 预设「${preset.id}」的 ${key}=${value} 不在可选值里（${allowed.join(' / ')}）`,
+          );
+        } else if (spec.kind === 'number') {
+          const parsed = Number(value);
+          assert.ok(Number.isFinite(parsed), `★ 预设「${preset.id}」的 ${key} 不是数字：${value}`);
+          if (spec.range !== undefined) {
+            assert.ok(
+              parsed >= spec.range.min && parsed <= spec.range.max,
+              `★ 预设「${preset.id}」的 ${key}=${value} 超出 ${spec.range.min}–${spec.range.max}`,
+            );
+          }
+        } else {
+          assert.ok(
+            value === 'true' || value === 'false',
+            `★ 预设「${preset.id}」的 ${key} 必须是 true/false`,
+          );
+        }
+      }
+    }
+  });
+
+  test('★★★ 套用预设必须覆盖全部 16 个参数（不留半套）', () => {
+    /*
+     * 用户要求："一键快速设置"。
+     *
+     * 如果预设只覆盖一部分，剩下的会停留在上一组的值上 ——
+     * 于是"套了保守预设但熔断还是激进档的 30%"这类半生效状态会出现，
+     * 而界面上看不出来。
+     *
+     * `applyJevPreset` 返回 `applied` 就是实际写入的键数。
+     */
+    const balanced = JEV_PRESETS.find((p) => p.id === 'balanced');
+    assert.ok(balanced !== undefined, '★ 必须内置 balanced 预设');
+    if (balanced === undefined) return;
+    assert.equal(
+      Object.keys(balanced.values).length,
+      JEV_OPTIONS.length,
+      '★ 均衡预设必须覆盖全部选项（否则会留下旧值）',
+    );
+  });
+
+  test('★★★ 两个预设的参数组必须真的不同（不是换了个名字的同一组）', () => {
+    /* 反向校准：如果 balanced 与 aggressive 的值全一样，"选预设"就没有意义。 */
+    const balanced = JEV_PRESETS.find((p) => p.id === 'balanced');
+    const aggressive = JEV_PRESETS.find((p) => p.id === 'aggressive');
+    assert.ok(balanced !== undefined && aggressive !== undefined);
+    if (balanced === undefined || aggressive === undefined) return;
+
+    const differing = Object.keys(balanced.values).filter(
+      (key) => balanced.values[key] !== aggressive.values[key],
+    );
+    assert.ok(
+      differing.length >= 5,
+      `★ 均衡与激进应有明显差异，实际只差 ${differing.length} 项：${differing.join('、')}`,
+    );
+    /* 激进的单笔风险必须更大、持仓上限必须更多 —— 这是"激进"的定义。 */
+    assert.ok(
+      Number(aggressive.values.risk_percent) > Number(balanced.values.risk_percent),
+      '★ 激进的单笔风险应更高',
+    );
+    assert.ok(
+      Number(aggressive.values.max_positions) > Number(balanced.values.max_positions),
+      '★ 激进的最大持仓应更多',
+    );
+  });
+
+  test('★★ 套用不存在的预设必须一个都不写', () => {
+    const before = JEV_OPTIONS.map((spec) => getJevOption(spec.key)).join('|');
+    const result = applyJevPreset('definitely-not-a-preset');
+    assert.equal(result.applied, 0, '★ 不存在的预设不该写入任何值');
+    assert.ok(result.unknown.length > 0, '★ 应报告未知的预设 id');
+    const after = JEV_OPTIONS.map((spec) => getJevOption(spec.key)).join('|');
+    assert.equal(before, after, '★ 失败的套用不能改变任何现有配置');
   });
 });

@@ -645,6 +645,186 @@ export function jevOptionSpec(key: string): JevOptionSpec | null {
  * ⚠️ JEV 选项**不读 `.env`** —— 它们是新模式专属的，没有"老部署兼容"的问题，
  * 多一层只会让"这个值到底从哪来"更难回答。
  */
+/**
+ * ══════════════════════════════════════════════════════════════════════════
+ *  **JEV 参数预设**
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * 用户原话（2026-10-20）：
+ * > 「里面增加一个预设模式，把你觉得最能挣钱得参数 设置一个内置预设，
+ * >  以后可以一键快速设置」
+ *
+ * ## 为什么需要预设
+ *
+ * JEV 有 16 个参数，它们**互相耦合**：
+ * ```
+ *   risk_percent 调大 ⇒ 单笔保证金变大 ⇒ max_margin_usage 会更快用完
+ *   min_rr 调大      ⇒ 止盈更难达到   ⇒ 胜率下降，需要更高 min_confidence 补偿
+ *   max_positions 调大 ⇒ 保证金被摊薄  ⇒ 每个仓位变小，止损占比反而降低
+ * ```
+ * 操作员一个个调很难同时满足这些约束 —— 参数之间不是独立的。
+ * 预设把**一组自洽的参数**作为整体发出去，避免"调了 A 忘了 B"。
+ *
+ * ## `balanced` 这一组是怎么定的（不是拍脑袋）
+ *
+ * 基于 2026-10-19~20 的实盘数据（65 笔）：
+ * ```
+ *   止盈 6 笔 → 平均 +3.99/笔
+ *   止损 51 笔 → 平均 -0.65/笔
+ *   单笔止盈是单笔止损的 6 倍 —— 数学上该赚，但止盈率只有 10.5%
+ *   大亏 17 笔里 16 笔是"逆势做多"（空头行情里一直抄底）
+ * ```
+ * ⇒ 两个结论直接落进参数：
+ * 1. **止盈率太低 ⇒ `min_rr` 从 2.5 回到 2.0**（2.5 的目标太远，几乎打不到）
+ * 2. **低质量单太多 ⇒ `min_confidence` 提到 55**（只做有把握的）
+ * 3. **一次开 10 个太激进 ⇒ `max_entries_per_cycle` 降到 3**
+ * 4. **20 个仓位盯不住 ⇒ `max_positions` 降到 8**
+ *
+ * ⚠️ **`max_margin_usage` 保持 60%**：8 个仓位 × 5% 风险 = 40%，
+ * 60% 留了 20 个百分点的缓冲。
+ */
+export interface JevPreset {
+  id: string;
+  label: string;
+  summary: string;
+  /** 每一个键都必须在 `JEV_OPTIONS` 里存在，且值必须合法 —— 见 `applyJevPreset`。 */
+  values: Readonly<Record<string, string>>;
+}
+
+export const JEV_PRESETS: readonly JevPreset[] = [
+  {
+    id: 'balanced',
+    label: '均衡（推荐）',
+    summary: '只做有把握的、目标 2:1、一轮最多 3 仓。基于实盘 65 笔数据定的一组自洽参数。',
+    values: {
+      coin_select: 'jev',
+      entry_type: 'jev',
+      leverage_mode: 'jev',
+      margin_mode: 'jev',
+      min_confidence: '55',
+      min_rr: '2',
+      risk_percent: '5',
+      max_positions: '8',
+      max_entries_per_cycle: '3',
+      max_entries_per_hour: '10',
+      max_margin_usage: '60',
+      max_daily_loss_percent: '30',
+      breakeven_trigger_percent: '5',
+      trailing_stop_percent: '3',
+      max_candidates: '8',
+      hold_ask_every: '1',
+      allow_short: 'true',
+      allow_resize: 'true',
+      allow_trailing: 'true',
+      leverage_manual: '20',
+    },
+  },
+  {
+    id: 'aggressive',
+    label: '激进（测试用）',
+    summary: '宽进宽出、每轮最多 10 仓、风控放宽。只适合短期验证能力，不适合长期跑。',
+    values: {
+      coin_select: 'jev',
+      entry_type: 'jev',
+      leverage_mode: 'jev',
+      margin_mode: 'jev',
+      min_confidence: '20',
+      min_rr: '2',
+      risk_percent: '8',
+      max_positions: '20',
+      max_entries_per_cycle: '10',
+      max_entries_per_hour: '20',
+      max_margin_usage: '80',
+      max_daily_loss_percent: '30',
+      breakeven_trigger_percent: '8',
+      trailing_stop_percent: '3',
+      max_candidates: '8',
+      hold_ask_every: '1',
+      allow_short: 'true',
+      allow_resize: 'true',
+      allow_trailing: 'true',
+      leverage_manual: '20',
+    },
+  },
+  {
+    id: 'conservative',
+    label: '保守',
+    summary: '只做最有把握的、目标 2.5:1、单笔风险 2%、最多 4 仓。回撤优先。',
+    values: {
+      coin_select: 'code',
+      entry_type: 'jev',
+      leverage_mode: 'jev',
+      margin_mode: 'isolated',
+      min_confidence: '55',
+      min_rr: '2.5',
+      risk_percent: '2',
+      max_positions: '4',
+      max_entries_per_cycle: '2',
+      max_entries_per_hour: '6',
+      max_margin_usage: '40',
+      max_daily_loss_percent: '10',
+      breakeven_trigger_percent: '5',
+      trailing_stop_percent: '2',
+      max_candidates: '4',
+      hold_ask_every: '1',
+      allow_short: 'true',
+      allow_resize: 'false',
+      allow_trailing: 'true',
+      leverage_manual: '10',
+    },
+  },
+];
+
+/**
+ * **应用一个预设**（全量覆盖 16 个参数）。
+ *
+ * ## 为什么是"全量覆盖"而不是"只改预设里写到的键"
+ *
+ * 预设的意义是**一组自洽的参数**。如果只覆盖一部分，剩下的会停留在上一组的值上 ——
+ * 于是"我套了保守预设，但 `max_daily_loss_percent` 还是激进档的 30%"这类
+ * 半生效状态就会出现，而界面上看不出来。
+ *
+ * ## 校验
+ *
+ * 每个键都必须存在于 `JEV_OPTIONS` 且值合法（枚举值必须在选项里、
+ * 数值必须在区间内）—— **写错的预设应该在测试里就红**，
+ * 不能让它在运行时静默写进一个非法值。
+ *
+ * @returns 实际写入的键数量；有任何非法键时**一个都不写**（原子性）。
+ */
+export function applyJevPreset(presetId: string): { applied: number; unknown: string[] } {
+  const preset = JEV_PRESETS.find((candidate) => candidate.id === presetId);
+  if (preset === undefined) return { applied: 0, unknown: [`preset:${presetId}`] };
+
+  const specs = new Map(JEV_OPTIONS.map((spec) => [spec.key, spec]));
+  const invalid: string[] = [];
+  for (const [key, value] of Object.entries(preset.values)) {
+    const spec = specs.get(key);
+    if (spec === undefined) {
+      invalid.push(key);
+      continue;
+    }
+    if (spec.kind === 'enum') {
+      /* `options` 在类型上可选 —— 枚举型没给选项本身就是配置错误，算非法。 */
+      const options = spec.options ?? [];
+      if (!options.some((option) => option.value === value)) invalid.push(`${key}=${value}`);
+    } else if (spec.kind === 'number') {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) invalid.push(`${key}=${value}`);
+      else if (spec.range !== undefined && (parsed < spec.range.min || parsed > spec.range.max)) {
+        invalid.push(`${key}=${value}(超出 ${spec.range.min}–${spec.range.max})`);
+      }
+    } else if (spec.kind === 'boolean') {
+      if (value !== 'true' && value !== 'false') invalid.push(`${key}=${value}`);
+    }
+  }
+  /* 有任何一个非法 ⇒ 一个都不写（原子性：不留半套参数）。 */
+  if (invalid.length > 0) return { applied: 0, unknown: invalid };
+
+  for (const [key, value] of Object.entries(preset.values)) setJevOption(key, value);
+  return { applied: Object.keys(preset.values).length, unknown: [] };
+}
+
 export function getJevOption(key: string): string {
   const spec = jevOptionSpec(key);
   if (spec === null) return '';

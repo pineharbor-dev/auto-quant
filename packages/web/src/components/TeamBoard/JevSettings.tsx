@@ -22,7 +22,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 
-import { api, type JevOption } from '../../lib/api.js';
+import { api, type JevOption, type JevPreset } from '../../lib/api.js';
 import { ErrorNote, Spinner3 } from '../ui.js';
 
 /**
@@ -88,6 +88,8 @@ function estimateDailyCost(opt: Record<string, string>): {
 
 export function JevSettings({ traderId }: { traderId: number }) {
   const [options, setOptions] = useState<JevOption[] | null>(null);
+  /** 可一键套用的参数预设（与服务端同一份定义）。 */
+  const [presets, setPresets] = useState<JevPreset[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   /** 刚改过的项 —— 用来显示"已保存，下一轮生效"的短暂提示。 */
@@ -98,6 +100,7 @@ export function JevSettings({ traderId }: { traderId: number }) {
       try {
         const r = await api.traderJevOptions(traderId, signal);
         setOptions(r.options);
+        setPresets(r.presets ?? []);
         setError(null);
       } catch (err) {
         if ((err as Error).name === 'AbortError') return;
@@ -125,6 +128,30 @@ export function JevSettings({ traderId }: { traderId: number }) {
       setError(null);
       setJustSaved(key);
       window.setTimeout(() => setJustSaved((k) => (k === key ? null : k)), 2500);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  /**
+   * **一键套用预设**（2026-10-20 用户要求）。
+   *
+   * ⚠️ 不做乐观更新 —— 这 16 个参数会立刻改变交易行为，
+   * 界面先假装成功、实际失败是最糟的体验（与 `save` 同一条纪律）。
+   */
+  const applyPreset = async (presetId: string): Promise<void> => {
+    setBusyKey(`preset:${presetId}`);
+    try {
+      const r = await api.applyTraderJevPreset(traderId, presetId);
+      setOptions(r.options);
+      setError(null);
+      setJustSaved(`preset:${presetId}`);
+      window.setTimeout(
+        () => setJustSaved((k) => (k === `preset:${presetId}` ? null : k)),
+        2500,
+      );
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -186,6 +213,53 @@ export function JevSettings({ traderId }: { traderId: number }) {
           </div>
         );
       })()}
+
+      {/*
+        ⚠️ **一键预设**（2026-10-20 用户要求）。
+        用户原话：「增加一个预设模式，把你觉得最能挣钱得参数 设置一个内置预设，
+        以后可以一键快速设置」。
+
+        ## 为什么它必须排在单个选项【之前】
+
+        那是操作顺序：先决定"我要什么风格"，再看"要不要微调某一项"。
+        如果预设放在 16 个控件下面，操作员会先一个个调完，
+        最后才发现上面有一键方案 —— 那等于白调。
+
+        ## 为什么显示 `summary` 而不是列参数
+
+        16 个参数列出来没人看得懂"这组到底激进还是保守"。
+        `summary` 说的是一句话结论（基于什么数据、适合什么场景）。
+      */}
+      {presets.length > 0 && (
+        <div className="mb-2 rounded border border-base-700 bg-base-850/40 px-2.5 py-2">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[11px] font-medium text-ink-lo">一键预设</span>
+            <span className="text-[10px] text-ink-faint">套用后仍可逐项微调</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {presets.map((preset) => {
+              const busy = busyKey === `preset:${preset.id}`;
+              const saved = justSaved === `preset:${preset.id}`;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void applyPreset(preset.id)}
+                  className="flex flex-col items-start gap-0.5 rounded border border-base-700 bg-base-900/60 px-2 py-1.5 text-left transition hover:border-brand-500/60 hover:bg-base-800/60 disabled:opacity-50"
+                >
+                  <span className="flex items-center gap-1.5 text-[11px] font-medium text-ink-hi">
+                    {preset.label}
+                    {saved && <span className="text-[10px] font-normal text-up">已套用</span>}
+                    {busy && <span className="text-[10px] font-normal text-ink-faint">写入中…</span>}
+                  </span>
+                  <span className="text-[10px] leading-4 text-ink-faint">{preset.summary}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <ul className="space-y-2">
         {(options ?? []).map((o) => {
