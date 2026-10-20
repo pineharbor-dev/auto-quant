@@ -630,15 +630,109 @@ export function buildState(
   if (c.displacementPercent !== undefined) {
     lines.push(`近3根位移 D = ${c.displacementPercent.toFixed(3)}%`);
   }
-  if (c.rsi7 !== undefined) lines.push(`RSI7 = ${c.rsi7.toFixed(1)}`);
-  if (c.ema20 !== undefined) lines.push(`EMA20 = ${c.ema20}`);
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️⚠️ **给「关系」而不是孤立数字**（2026-10-20 实盘事故）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 事故
+   *
+   * 一夜之间（下跌行情，BTC -1.54%、ETH -2.13%）：
+   * ```
+   *   做多 57 笔 → 净 -10.10（胜率 35%）
+   *   做空  8 笔 → 净  +2.10（胜率 50%）
+   *   ⇒ 它 88% 的时间在做多，而做空是赚钱的
+   * ```
+   *
+   * ## 根因：它拿到的是一串孤立数字
+   *
+   * 原来 state 里写：
+   * ```
+   *   当前价 81458
+   *   EMA20  82000
+   *   RSI7 = 35
+   *   24h 涨跌 -1.54%
+   * ```
+   * **这四个数之间的关系没有被说出来。** Jev 是分类器，不做算术 ——
+   * 它无法从「81458 与 82000」推出「价格在均线下方 = 空头结构」。
+   * 于是它看到的"跌了 1.54%"读成了"便宜了 → 抄底做多"，
+   * 而不是"趋势向下 → 顺势做空"。
+   *
+   * ## 修法：把关系算好再说给它听
+   *
+   * ```
+   *   ✗ EMA20 = 82000
+   *   ✓ 价格在 EMA20 下方 0.66%（空头结构，做多为逆势）
+   * ```
+   * 这是**同一个事实的另一种表达**，而后者是可判断的结论。
+   */
+  if (c.rsi7 !== undefined) {
+    /* RSI 的语义：越高越超买（追多风险大），越低越超卖（追空风险大）。 */
+    const rsiNote =
+      c.rsi7 >= 70 ? '（超买区，追多风险大）' : c.rsi7 <= 30 ? '（超卖区，追空风险大）' : '';
+    lines.push(`RSI7 = ${c.rsi7.toFixed(1)}${rsiNote}`);
+  }
+  if (c.ema20 !== undefined && c.ema20 > 0) {
+    const deviationPercent = ((c.price - c.ema20) / c.ema20) * 100;
+    /*
+     * 结构判定。阈值 0.1% 是为了滤掉"贴着均线"的噪声 ——
+     * 那种情况说成"多头/空头结构"是过度解读。
+     */
+    const structure =
+      Math.abs(deviationPercent) < 0.1
+        ? '贴近均线（中性，方向不明）'
+        : deviationPercent > 0
+          ? '多头结构（顺势做多、做空为逆势）'
+          : '空头结构（顺势做空、做多为逆势）';
+    lines.push(
+      `EMA20 = ${c.ema20 < 1 ? c.ema20.toFixed(6) : c.ema20 < 100 ? c.ema20.toFixed(3) : c.ema20.toFixed(2)} —— 价格在均线${deviationPercent >= 0 ? '上方' : '下方'} ` +
+        `${Math.abs(deviationPercent).toFixed(2)}%，${structure}`,
+    );
+  }
 
+  /*
+   * ⚠️ **盈亏比文字必须是真实配置值，不能写死 2:1**（2026-10-20 实盘抓到）。
+   *
+   * 实盘证据：用户把 `min_rr` 从 2 改成 2.5 后，
+   * ```
+   *   state 里仍写「候选止盈价档（2:1 盈亏比）」
+   *   而实际止盈价是按 2.5 算的
+   * ```
+   * Jev 会照文字理解（"2:1"），于是它对"值不值得做"的判断与真实盈亏比脱节 ——
+   * 那正是它在这段行情里一直做多的原因之一：它以为自己拿的是 2:1，
+   * 而实际结构已经是 2.5:1。
+   *
+   * ⇒ 文案与算式必须同源（都用 `rr`）。
+   */
+  /*
+   * 盈亏比从**档位本身**反推，而不是再读一次配置。
+   *
+   * 理由：`buildState` 收到的 `longTiers`/`shortTiers` 已经是算好的价，
+   * 从它们反推出的 rr 就是**这一轮真正生效的**那个值 ——
+   * 再读一次配置只可能引入"文案与算式不同源"的新分叉。
+   * 那正是这条注释上面记着的那个 bug。
+   */
+  const rrForText = (() => {
+    const risk = Math.abs(shortTiers.stop.B - shortTiers.take.B);
+    const reward = Math.abs(shortTiers.take.B - shortTiers.stop.B);
+    void risk;
+    void reward;
+    /*
+     * 更直接：用做空 B 档的 (止盈 - 止损) / (止损 - 价格基准)。
+     * 但 `buildState` 拿不到 price 之外的原始止损距离 ——
+     * 所以用 A/B 两档的止盈差与止损差之比，两档用的是同一个 rr：
+     *   (take.B - take.A) / (stop.B - stop.A) = rr
+     */
+    const stopDelta = Math.abs(shortTiers.stop.B - shortTiers.stop.A);
+    const takeDelta = Math.abs(shortTiers.take.B - shortTiers.take.A);
+    return stopDelta > 0 ? Math.max(0.5, takeDelta / stopDelta) : 2;
+  })();
   const tierLine = (label: string, t: Tiers, verb: string): string[] => [
     `${verb}候选仓位档（名义价值，已按风险预算算好）：` +
       `A=${t.size.A.toFixed(2)}U  B=${t.size.B.toFixed(2)}U  C=${t.size.C.toFixed(2)}U`,
     `${verb}候选止损价档：` +
       `A=${t.stop.A.toFixed(6)}（1.0×ATR）  B=${t.stop.B.toFixed(6)}（1.5×ATR）  C=${t.stop.C.toFixed(6)}（2.0×ATR）`,
-    `${verb}候选止盈价档（2:1 盈亏比）：` +
+    `${verb}候选止盈价档（${rrForText.toFixed(1)}:1 盈亏比）：` +
       `A=${t.take.A.toFixed(6)}  B=${t.take.B.toFixed(6)}  C=${t.take.C.toFixed(6)}`,
   ];
 

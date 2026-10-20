@@ -1377,3 +1377,91 @@ describe('JEV 模式：缺止盈时的兜底规则', () => {
     }
   });
 });
+
+describe('JEV 模式：趋势语境（2026-10-20 实盘事故后补）', () => {
+  it('★★★ 必须告诉它「价格在均线上方还是下方」，不能只给两个孤立数字', () => {
+    /*
+     * ## 事故
+     *
+     * 一夜下跌行情（BTC -1.54%、ETH -2.13%）：
+     * ```
+     *   做多 57 笔 → 净 -10.10（胜率 35%）
+     *   做空  8 笔 → 净  +2.10（胜率 50%）
+     *   ⇒ 它 88% 的时间在做多，而做空是赚钱的
+     * ```
+     *
+     * ## 根因
+     *
+     * 原来 state 只给：`当前价 81458` / `EMA20 = 82000`。
+     * **两者关系没说**。Jev 是分类器、不做算术 —— 它推不出
+     * 「81458 < 82000 ⇒ 空头结构 ⇒ 做多是逆势」。
+     * 于是"跌了 1.54%"被读成"便宜了，抄底"。
+     */
+    const down = {
+      symbol: 'BTCUSDT',
+      price: 81458,
+      atr: 1200,
+      change24hPercent: -1.54,
+      rsi7: 35,
+      ema20: 82000,
+    };
+    const t = tiersFor(down, OPTS, 'long');
+    const state = buildState(down, t, t);
+
+    assert.ok(state.includes('价格在均线下方'), '★ 必须直说价格在均线哪一侧');
+    assert.ok(state.includes('空头结构'), '★ 必须给出结构结论');
+    assert.ok(state.includes('做多为逆势'), '★ 必须点明逆势的方向');
+    assert.ok(
+      /价格在均线下方 0\.\d+%/.test(state),
+      '★ 偏离度要算好给它（它不会自己减）',
+    );
+  });
+
+  it('★★★ 上涨行情必须判成多头结构（反向校准，防止永远输出"空头"）', () => {
+    const up = {
+      symbol: 'BTCUSDT',
+      price: 85000,
+      atr: 1200,
+      change24hPercent: 3.2,
+      rsi7: 72,
+      ema20: 82000,
+    };
+    const t = tiersFor(up, OPTS, 'long');
+    const state = buildState(up, t, t);
+    assert.ok(state.includes('价格在均线上方'), '★ 应判成上方');
+    assert.ok(state.includes('多头结构'), '★ 应判成多头结构');
+    assert.ok(state.includes('做空为逆势'), '★ 应点明逆势方向');
+    assert.ok(state.includes('超买区'), '★ RSI 72 应提示超买');
+  });
+
+  it('★★★ 盈亏比文字必须是真实配置值，不能写死 2:1', () => {
+    /*
+     * 实盘证据：用户把 `min_rr` 从 2 改成 2.5 后，
+     * state 里仍写「候选止盈价档（2:1 盈亏比）」，而实际止盈是按 2.5 算的。
+     *
+     * Jev 会照文字理解 —— 它以为自己拿的是 2:1，
+     * 于是对"值不值得做"的判断与真实结构脱节。
+     *
+     * ⚠️ `buildState` 现在从**档位本身**反推 rr（`(take.B-take.A)/(stop.B-stop.A)`），
+     * 保证文案与算式同源 —— 所以这条测试同时钉住了那个反推逻辑。
+     */
+    const c = { symbol: 'XUSDT', price: 100, atr: 2 };
+    for (const rr of [1.5, 2, 2.5, 3]) {
+      const opts: JevModeOptions = { ...OPTS, readMinRiskRewardRatio: () => rr };
+      const t = tiersFor(c, opts, 'long');
+      const state = buildState(c, t, t);
+      assert.ok(
+        state.includes(`${rr.toFixed(1)}:1 盈亏比`),
+        `★ rr=${rr} 时 state 应写「${rr.toFixed(1)}:1 盈亏比」（写死 2:1 会让它的判断失真）`,
+      );
+    }
+  });
+
+  it('★★ 贴近均线时不该过度解读成结构（阈值 0.1%）', () => {
+    const flat = { symbol: 'XUSDT', price: 100, atr: 2, ema20: 100.05 };
+    const t = tiersFor(flat, OPTS, 'long');
+    const state = buildState(flat, t, t);
+    assert.ok(state.includes('贴近均线'), '★ 偏离 0.05% 应判中性');
+    assert.ok(!state.includes('空头结构'), '★ 不该说成空头结构');
+  });
+});
