@@ -234,9 +234,61 @@ export const exchanges = {
     getDb().run('DELETE FROM exchange_accounts WHERE id = ?', id);
   },
 
-  /** Traders referencing this credential, used to block unsafe deletes. */
+  /**
+   * 有多少个机器人**真的在靠这个凭据交易**（删除前的安全检查）。
+   *
+   * ## ⚠️ 只数「正在运行」的机器人 —— 已停止的不算（2026-10-23 用户实测）
+   *
+   * ## 症状
+   *
+   * 用户在「交易所」页面点删除，界面报：
+   * ```
+   *   ⚠️ 该凭据正被 3 个机器人使用，请先删除或改派它们。
+   * ```
+   * 而那 3 个机器人**全部是 stopped 状态**，其中两个是几个月前建的测试机器人。
+   * ⇒ **一个没人用的凭据删不掉**，而唯一的"解法"是先去把那 3 个机器人删了 ——
+   * 用户想删的是凭据，不是机器人。
+   *
+   * ## 为什么判据是 `status = 'running'`
+   *
+   * 一个停止的机器人**不会发起任何下单、查余额、对账** —— 它对这个凭据
+   * 没有任何实际占用。真正危险的是"删凭据时还有个机器人正在用它下单"，
+   * 那种情况必须挡住（否则正在跑的仓位会失去管理）。
+   *
+   * `status` 是**本地就能确定**的事实，不引入额外失败点（对比"去查交易所
+   * 有没有持仓"—— 那要多一次网络往返，且账户本身可能就在故障中）。
+   *
+   * ⚠️ 与 `strategies.usageCount` 的修法同一条纪律（见那里 2026-10-19 那段）：
+   * **把"没人用的东西删不掉"当成一个 BUG 来修，而不是让用户去清理垃圾数据。**
+   */
   usageCount(id: number): number {
-    return getDb().count('SELECT COUNT(*) AS n FROM traders WHERE exchange_account_id = ?', id);
+    return getDb().count(
+      "SELECT COUNT(*) AS n FROM traders WHERE exchange_account_id = ? AND status = 'running'",
+      id,
+    );
+  },
+
+  /**
+   * 把某个凭据从所有机器人上解绑（`exchange_account_id` 置 NULL）。
+   *
+   * ## 为什么删除凭据时必须解绑（2026-10-23）
+   *
+   * 停止的机器人仍然记着 `exchange_account_id`。直接 `DELETE` 那个凭据会让
+   * 它们指向一个**不存在的账户 id** —— 下次有人启动它们时，报错会是
+   * "找不到账户"（一个不明所以的失败），而不是"你需要先选一个账户"。
+   *
+   * ⇒ 删凭据时顺手把引用置空，让那些机器人的状态是**明确的「没有账户」**。
+   * 界面上的"未配置"比"指向一个幽灵 id"诚实得多。
+   *
+   * @returns 被解绑的机器人数量
+   */
+  detachAll(id: number): number {
+    const result = getDb().run(
+      'UPDATE traders SET exchange_account_id = NULL, updated_at = ? WHERE exchange_account_id = ?',
+      now(),
+      id,
+    );
+    return Number(result.changes ?? 0);
   },
 };
 

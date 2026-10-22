@@ -1479,15 +1479,52 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
 
   app.delete('/api/exchange-accounts/:id', authed, guard(async (_body: unknown, request, reply) => {
     const id = idOf(request);
+    /*
+     * ══════════════════════════════════════════════════════════════════════════
+     *  ⚠️ **只有「正在运行」的机器人能挡住删除**（2026-10-23 用户实测）
+     * ══════════════════════════════════════════════════════════════════════════
+     *
+     * ## 原来的行为（用户报的 BUG）
+     *
+     * 界面上报「该凭据正被 3 个机器人使用，请先删除或改派它们」，
+     * 而那 3 个机器人**全部是 stopped**。用户想删的是凭据，不是机器人 ——
+     * 却被要求先去删机器人才能删凭据。
+     *
+     * ## 现在的行为
+     *
+     * ```
+     *   还有 running 的机器人在用 → 仍然挡住（那是真的危险：
+     *                                删了它，正在跑的仓位会失去管理）
+     *   只剩 stopped 的机器人在用 → 解绑它们，然后删掉凭据
+     * ```
+     *
+     * `usageCount()` 的判据已改成只数 running（见仓储里那段说明）。
+     * 走到这里的 `inUse` 因此就是"真正在用的数量"。
+     *
+     * ## 那条 warn 的意义
+     *
+     * 解绑是**有后果的操作**：那些机器人下次启动时会报"没有配置交易所账户"。
+     * 那不是故障，但操作员需要知道是他的删除导致的 —— 否则他会以为是新 BUG。
+     */
     const inUse = exchanges.usageCount(id);
     if (inUse > 0) {
       return reply.code(409).send({
-        error: `该凭据正被 ${inUse} 个机器人使用，请先删除或改派它们。`,
+        error:
+          `该凭据正被 ${inUse} 个**正在运行**的机器人使用。请先停止它们再删除 —— ` +
+          '运行中的机器人被解绑后，它手上的仓位会失去管理。',
       });
     }
+    /* 已停止的机器人仍然引用着它 —— 先解绑，避免留下指向幽灵 id 的行。 */
+    const detached = exchanges.detachAll(id);
     exchanges.remove(id);
     deps.balance.invalidate(id);
-    return { ok: true };
+    if (detached > 0) {
+      log.warn(
+        `交易所凭据已删除，顺带解绑了 ${detached} 个已停止的机器人（它们下次启动需要重新选账户）`,
+        { accountId: id, detachedTraders: detached },
+      );
+    }
+    return { ok: true, detachedTraders: detached };
   }));
 
   /** Connect with the stored key and report exactly what is wrong, if anything. */
