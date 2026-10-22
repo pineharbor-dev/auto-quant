@@ -383,7 +383,20 @@ test('anthropic parser: only text blocks are joined, thinking blocks are skipped
 
   const parsed = anthropic.parseResponse(payload, 'claude-opus-5');
   assert.equal(parsed.text, 'Funding is positive on BTC.');
-  assert.equal(parsed.finishReason, 'stop');
+  /*
+   * ⚠️ **这个断言在 2026-10-23 改过**：原来期望 `'stop'`。
+   *
+   * 那时 `tool_use` 块被**完全忽略** —— 而 `stop_reason` 写的是 `end_turn`
+   * （有的网关在带工具调用时就这么报）。结果是：上层看到 `finishReason: 'stop'`
+   * 就把这一轮当成"最终回答"，**那个工具调用永远不会被执行**，
+   * 模型会一直等一个它以为已经发生的结果。
+   *
+   * ⇒ 现在的判据是「**有没有 tool_use 块**」，而不是信 `stop_reason`。
+   * 这是"表面成功、实际空转"那类故障的直接修复。
+   */
+  assert.equal(parsed.finishReason, 'tool_calls');
+  assert.equal(parsed.toolCalls?.length, 1, 'tool_use 块必须被提取出来');
+  assert.equal(parsed.toolCalls?.[0]?.name, 'get_funding');
   assert.deepEqual(parsed.usage, { promptTokens: 1024, completionTokens: 256, totalTokens: 1280, cachedTokens: null, reasoningTokens: null });
   assert.equal(parsed.model, 'claude-opus-5');
 });
@@ -440,7 +453,17 @@ test('gemini parser: a functionCall part normalises to tool_calls, which has no 
   const parsed = gemini.parseResponse(payload, 'gemini-3.8-flash');
   assert.equal(parsed.finishReason, 'tool_calls');
   assert.equal(parsed.text, '');
-  assert.equal(parsed.isEmpty, true);
+  /*
+   * ⚠️ **断言在 2026-10-23 从 `true` 改成 `false`**。
+   *
+   * 原来"没有说话"就等于"空回复"，`isEmpty: true`。但**只发起工具调用、不说话的
+   * 响应不是空回复 —— 它是工具循环的正常一轮**。判成空会让上层当成异常重试，
+   * 而重试拿到的是同一个响应，于是**无限重试到预算耗尽**。
+   */
+  assert.equal(parsed.isEmpty, false);
+  assert.equal(parsed.toolCalls?.length, 1, 'functionCall 必须被提取出来');
+  assert.equal(parsed.toolCalls?.[0]?.name, 'get_price');
+  assert.equal(parsed.toolCalls?.[0]?.arguments, '{"symbol":"BTCUSDT"}');
 });
 
 test('gemini parser: thinking parts are not returned as the answer', () => {

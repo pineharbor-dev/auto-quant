@@ -7,6 +7,8 @@ import {
   type ChatMessage,
   type FinishReason,
   type OutboundRequest,
+  type ToolCall,
+  type ToolSpec,
   type WireUsage,
 } from './types.js';
 
@@ -22,6 +24,15 @@ export interface OpenAiBodyOptions {
   maxTokens?: number;
   jsonMode?: boolean;
   jsonSchema?: Record<string, unknown>;
+  /**
+   * **原生 function calling 的工具清单**（2026-10-23）。
+   *
+   * 直接透传成 OpenAI 的 `tools` 数组。见 `types.ts` 里 `ChatRequest.tools`
+   * 那段说明 —— 这是把"模型自己写 tool 字段"（实测 53% 成功率）
+   * 换成"协议保证的 tool_calls"的关键一步。
+   */
+  tools?: ToolSpec[];
+  toolChoice?: 'auto' | 'none' | 'required';
   /**
    * 思考等级，翻译成 OpenAI 的 `reasoning_effort`。
    *
@@ -133,7 +144,38 @@ export function buildBody(
 
   // Qwen accepts the system role only at `messages[0]`, so the canonical
   // "system is separate" split maps onto it exactly.
-  const wireMessages: JsonObject[] = turns.map((m) => ({ role: m.role, content: m.content }));
+  /*
+   * ⚠️ **`tool` 角色与 `assistant.tool_calls` 必须原样映射**（2026-10-23）。
+   *
+   * 原生 function calling 的三条消息形状：
+   * ```jsonc
+   *   {"role":"assistant","content":null,"tool_calls":[…]}
+   *   {"role":"tool","tool_call_id":"call_abc","content":"{\"ok\":true}"}
+   *   {"role":"assistant","content":"最终回答"}
+   * ```
+   * 只写 `{role, content}` 会把 `tool_call_id` 丢掉 —— 而那是**把工具结果
+   * 与具体调用对上**的唯一凭据，丢了以后模型会认为"这段结果没人问过"，
+   * 表现是它反复调同一个工具、或者干脆回一句"我没有相关信息"。
+   */
+  const wireMessages: JsonObject[] = turns.map((m) => {
+    const base: JsonObject = { role: m.role, content: m.content };
+    if (m.role === 'tool' && m.toolCallId !== undefined) {
+      base['tool_call_id'] = m.toolCallId;
+    }
+    if (m.role === 'assistant' && m.toolCalls !== undefined && m.toolCalls.length > 0) {
+      base['tool_calls'] = m.toolCalls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: c.arguments },
+      }));
+      /*
+       * OpenAI 要求带工具调用的 assistant 消息 `content` 为 null 或省略；
+       * 传空字符串在某些兼容网关上会被判成 invalid_request。
+       */
+      if (m.content.length === 0) base['content'] = null;
+    }
+    return base;
+  });
   if (system !== undefined) wireMessages.unshift({ role: 'system', content: system });
 
   const body: JsonObject = {
@@ -184,6 +226,48 @@ export function buildBody(
         body['response_format'] = { type: 'json_object' };
       }
     }
+  }
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  原生 function calling（2026-10-23）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * ## 为什么加这一段
+   *
+   * 实测 `#10`（智能托管）：`agent_runs` 里 **ok 85 / failed 74（53% 成功率）**，
+   * 失败原因几乎全是同一句：
+   * ```
+   *   "JSON 解析成功，但里面没有 tool 字段 —— 你只写了 thought"
+   * ```
+   * 而提示词里已经用 5 处整段警告反复强调那个格式，**模型仍然不听**。
+   * 根本原因：「在自由文本里遵守一个格式约定」是模型的弱项，不是它不配合。
+   *
+   * 原生 function calling 由 API 参数把工具清单传下去，模型返回结构化的
+   * `tool_calls` —— **"忘了写 tool 字段"这种失败形态在协议上就不存在了**。
+   *
+   * ## 与 `response_format` 的互斥
+   *
+   * 两者**不能同时发**：`tools` 要求模型在"调工具"和"直接回答"之间选，
+   * 而 `response_format: json_object` 强制它必须吐一个 JSON 对象。
+   * 同时发会让某些 provider 直接 400，另一些会让模型永远不调工具。
+   * ⇒ 调用方给了 `tools` 就以 tools 为准（那说明它要的就是工具循环）。
+   */
+  if (options.tools !== undefined && options.tools.length > 0) {
+    body['tools'] = options.tools.map((t) => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
+    body['tool_choice'] = options.toolChoice ?? 'auto';
+    /*
+     * tools 模式下必须撤掉 response_format —— 见上面那段互斥说明。
+     * 用 delete 而不是"不写"，因为上面可能已经按 jsonMode 写进去了。
+     */
+    delete body['response_format'];
   }
 
   return body;
@@ -327,6 +411,59 @@ export interface OpenAiParsedResponse {
   model: string | null;
   /** True when the provider returned HTTP 200 with no assistant text at all. */
   isEmpty: boolean;
+  /**
+   * 模型这一轮要调的工具（原生 function calling，2026-10-23）。
+   *
+   * `undefined` = 响应里没有 `tool_calls` 字段（老路径 / 模型选择直接回答）。
+   * `[]` **不会出现** —— 空数组没有信息量，与"没有"合并成 `undefined`，
+   * 免得上层要区分两种"没工具"的状态。
+   */
+  toolCalls?: ToolCall[];
+}
+
+/**
+ * 从 OpenAI 响应的 `message.tool_calls` 里取出调用列表。
+ *
+ * ## 为什么要单独抽一个函数
+ *
+ * 形状校验有三处易错点，而它们在流式与非流式两条路径上**完全一样**：
+ * ```jsonc
+ *   ① `function.arguments` 是**字符串**不是对象（有的网关会错发成对象）
+ *   ② 并行调多个工具时每一项都有独立 `id`
+ *   ③ `id` 缺失时必须补一个稳定值 —— 否则回传工具结果时对不上
+ * ```
+ * 复制两份的话，流式那条最早会在"某家网关把 arguments 发成对象"时炸掉，
+ * 而那种故障只在部分 provider 上出现，很难在测试里覆盖到。
+ */
+export function extractToolCalls(message: JsonObject | null): ToolCall[] | undefined {
+  if (message === null) return undefined;
+  const raw = message['tool_calls'];
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+
+  const out: ToolCall[] = [];
+  for (const [index, item] of raw.entries()) {
+    const entry = asObject(item);
+    if (!entry) continue;
+    const fn = asObject(entry['function']);
+    if (!fn) continue;
+    const name = typeof fn['name'] === 'string' ? fn['name'] : '';
+    if (name === '') continue;
+    /*
+     * `arguments` 规范上是字符串，但实测有网关直接发对象。
+     * 两种都要接受 —— 拒掉的话那一次工具调用会**静默消失**，
+     * 而模型会以为它调过了，于是不再重试。
+     */
+    const argsRaw = fn['arguments'];
+    const argsText =
+      typeof argsRaw === 'string'
+        ? argsRaw
+        : argsRaw === undefined || argsRaw === null
+          ? '{}'
+          : JSON.stringify(argsRaw);
+    const id = typeof entry['id'] === 'string' && entry['id'] !== '' ? entry['id'] : `call_${index}`;
+    out.push({ id, name, arguments: argsText });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 export function parseResponse(
@@ -348,6 +485,18 @@ export function parseResponse(
   const usage = normalizeUsage(asObject(root['usage']) as WireUsage | null);
   const model = typeof root['model'] === 'string' ? String(root['model']) : fallbackModel;
   let finishReason = normalizeFinishReason(first['finish_reason']);
+  const toolCalls = extractToolCalls(message);
+
+  /*
+   * ⚠️ **有 tool_calls 时必须把 `finishReason` 归到 `tool_calls`**
+   *（2026-10-23）。
+   *
+   * 有些兼容网关在带工具调用时仍报 `finish_reason: "stop"`。上层用
+   * `finishReason` 判断"这一轮是不是结束了"—— 若它看到 `stop` 就当成
+   * 最终回答，那**工具调用永远不会被执行**，模型会一直等着一个
+   * 它以为已经发生的工具结果。那正是"表面成功、实际空转"的形态。
+   */
+  if (toolCalls !== undefined) finishReason = 'tool_calls';
 
   // MiniMax severe moderation yields empty content flagged by these fields.
   if (
@@ -369,7 +518,18 @@ export function parseResponse(
     }
   }
 
-  return { text, finishReason, usage, model, isEmpty: text.trim() === '' };
+  /*
+   * `isEmpty` 的判据要带上工具调用：一个**只发起工具调用、没有说话**的响应
+   * 不是"空回复"，它是工具循环的正常一轮。判成空会让上层当成异常重试。
+   */
+  return {
+    text,
+    finishReason,
+    usage,
+    model,
+    isEmpty: text.trim() === '' && toolCalls === undefined,
+    toolCalls,
+  };
 }
 
 /** Convenience for the client: the descriptor default base URL when none is given. */

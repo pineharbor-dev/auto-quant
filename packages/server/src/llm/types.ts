@@ -8,8 +8,62 @@
  */
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /**
+   * `role === 'tool'` 时必填：这条消息回答的是哪个工具调用。
+   *
+   * ## 为什么需要它（原生 function calling 的协议要求）
+   *
+   * OpenAI 协议里工具结果必须回传成：
+   * ```jsonc
+   *   {"role":"assistant","tool_calls":[{"id":"call_abc","function":{…}}]}
+   *   {"role":"tool","tool_call_id":"call_abc","content":"{\"ok\":true}"}
+   * ```
+   * `tool_call_id` 是**把结果与具体调用对上**的唯一凭据 —— 少了它，
+   * 模型不知道这段结果是回答哪一问的（一次可以并行调多个工具）。
+   */
+  toolCallId?: string;
+  /**
+   * `role === 'tool'` 时填：这个结果回答的是**哪个工具**。
+   *
+   * ## 为什么既要有 id 又要有 name
+   *
+   * 两家协议关联方式不同：
+   * ```
+   *   OpenAI  → 靠 tool_call_id 关联
+   *   Gemini  → 靠工具名（functionResponse.name）关联，它没有 id 这个概念
+   * ```
+   * 只存 id 的话，Gemini 那条路就必须回查历史消息才能反推工具名 ——
+   * 而那是"在 adapter 里做本该由调用方记录的事"，很容易在裁剪上下文后失配。
+   */
+  toolName?: string;
+  /** `role === 'assistant'` 且这一轮要调工具时填。 */
+  toolCalls?: ToolCall[];
+}
+
+/** 模型发起的一次工具调用（各家 provider 归一化后的形状）。 */
+export interface ToolCall {
+  /** provider 给的调用 id；回传工具结果时必须带上。 */
+  id: string;
+  /** 工具名。 */
+  name: string;
+  /**
+   * 参数字符串（**不是对象**）。
+   *
+   * ⚠️ 保留原文而不是提前 `JSON.parse`：模型偶尔会吐出不合法的 JSON，
+   * 提前解析会让那一次调用直接变成"失败"，而原文至少能进审计日志、
+   * 也能让上层决定是重试还是放弃。解析发生在真正要用它的地方。
+   */
+  arguments: string;
+}
+
+/** 工具声明（`tools` 参数里的一项）。 */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  /** JSON Schema（object 根）。 */
+  parameters: Record<string, unknown>;
 }
 
 export interface ChatRequest {
@@ -21,6 +75,33 @@ export interface ChatRequest {
   jsonMode?: boolean;
   /** Optional JSON schema, used only where the provider supports strict schemas (see B.15). */
   jsonSchema?: Record<string, unknown>;
+  /**
+   * **原生 function calling 的工具清单**（2026-10-23）。
+   *
+   * ## 为什么要有它（一次实测 47% 失败率的根因）
+   *
+   * 原来我们让模型自己在 JSON 里写
+   * `{"thought":"…","tool":"get_performance","args":{…}}`，再由代码解析 `tool` 字段。
+   * 实测 `#10`（智能托管）：
+   * ```
+   *   agent_runs: ok 85 / failed 74  → 成功率 53%
+   *   失败原因几乎全是同一句：
+   *     "模型连续两轮没有输出可解析的工具调用：
+   *      JSON 解析成功，但里面没有 tool 字段 —— 你只写了 thought"
+   * ```
+   * 而提示词已经用整段篇幅反复强调这个格式（`loop.ts` 里 5 处警告），
+   * **模型仍然不听** —— 「在自由文本里遵守一个格式约定」本来就是它的弱项。
+   *
+   * 原生 function calling 把这件事从「模型自觉」变成「协议保证」：
+   * 工具清单由 API 参数传下去，模型返回结构化 `tool_calls`，
+   * **不存在"忘了写 tool 字段"这种失败形态**。
+   *
+   * ⚠️ **三家 provider 都要实现**（OpenAI 兼容 / Anthropic / Gemini 的 wire 格式
+   * 各不相同）—— 只做一家会在换模型时静默退化回旧的 JSON 解析路径。
+   */
+  tools?: ToolSpec[];
+  /** 强制/建议如何选工具。不传 = 由模型决定。 */
+  toolChoice?: 'auto' | 'none' | 'required';
   /**
    * 请求模型在回答前思考多久。
    *
@@ -65,6 +146,22 @@ export interface ChatResult {
   latencyMs: number;
   /** Raw provider payload, kept for the audit trail. */
   raw: unknown;
+  /**
+   * 模型这一轮要调的工具（原生 function calling 的产出）。
+   *
+   * ## 与 `text` 的关系
+   *
+   * 两者**可以同时非空**：模型可能先说一句话、再调工具。
+   * 也可能只有 `toolCalls`（`finishReason === 'tool_calls'`）或只有文字。
+   *
+   * ⚠️ **空数组和 `undefined` 不是一回事**：
+   * - `undefined` = 这次请求根本没带 `tools`（老路径，或者 provider 不支持）
+   * - `[]`       = 带了 `tools`，但模型这一轮选择不调
+   *
+   * 上层据此决定"该等工具结果"还是"该把它当最终回答"—— 混成一个会让
+   * 一轮本该结束的对话卡在等一个永远不来的工具调用上。
+   */
+  toolCalls?: ToolCall[];
 }
 
 /** Usage as every provider eventually spells it, before normalisation. */

@@ -7,7 +7,14 @@ import { nextReasoningEffort } from './effortFallback.js';
 import * as openai from './openaiCompatible.js';
 import * as anthropic from './anthropic.js';
 import * as gemini from './gemini.js';
-import { EMPTY_USAGE, type ChatMessage, type ChatResult, type OutboundRequest } from './types.js';
+import {
+  EMPTY_USAGE,
+  type ChatMessage,
+  type ChatResult,
+  type OutboundRequest,
+  type ToolCall,
+  type ToolSpec,
+} from './types.js';
 import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
 import { env } from '../env.js';
 
@@ -205,6 +212,23 @@ export interface ChatCallOptions {
    * ⚠️ 与 `maxTokens` 一样：**不传就完全不影响任何行为**（它只进日志 meta）。
    */
   context?: { traderId?: number; callSite?: string };
+  /**
+   * **本次调用的原生工具清单**（2026-10-23）。
+   *
+   * ## 为什么是 per-call 而不是构造时固定
+   *
+   * 同一台机器人对不同角色要用不同工具：策略师有 `get_experiments` /
+   * `set_params`，复盘员只有 `get_performance`。把它们放在构造参数上意味着
+   * "一个实例一套工具"，而实际链路里同一个 provider 实例会被多个角色复用。
+   *
+   * ## 不传 = 完全保持原行为
+   *
+   * 老的 JSON 协议路径（模型自己写 `{"tool":"…"}`）继续工作 ——
+   * 这一层**不强制**任何调用方迁移。
+   */
+  tools?: ToolSpec[];
+  /** 工具选择策略。不传 = `auto`。 */
+  toolChoice?: 'auto' | 'none' | 'required';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -705,7 +729,12 @@ export class LlmClient {
     return usesAnthropicProtocol(this.provider, this.model);
   }
 
-  private buildRequest(messages: ChatMessage[], probe: boolean, maxTokensOverride?: number): OutboundRequest {
+  private buildRequest(
+    messages: ChatMessage[],
+    probe: boolean,
+    maxTokensOverride?: number,
+    toolOverride?: { tools?: ToolSpec[]; toolChoice?: 'auto' | 'none' | 'required' },
+  ): OutboundRequest {
     /*
      * **本次调用的输出预算**：per-call 覆盖优先，否则用实例值。
      * 见 `chat()` 的 `maxTokens` 参数说明（思维链吃光预算时要能加大重试）。
@@ -724,6 +753,19 @@ export class LlmClient {
           jsonMode: this.jsonMode,
           ...(this.jsonSchema !== undefined ? { jsonSchema: this.jsonSchema } : {}),
           /*
+           * **原生 function calling 的工具清单**（2026-10-23）。
+           *
+           * 由上层（`trader/agent/loop.ts`）通过 `chat()` 的 `tools` 参数传进来，
+           * 这里原样透传给三家 adapter。探测请求（`probe`）刻意**不带** ——
+           * 探测只回答"端点通不通、钥匙对不对"，让它带工具清单会改变
+           * 那次请求的语义，而且白花 token。
+           */
+          ...(toolOverride?.tools !== undefined && toolOverride.tools.length > 0
+            ? { tools: toolOverride.tools }
+            : {}),
+          ...(toolOverride?.toolChoice !== undefined
+            ? { toolChoice: toolOverride.toolChoice }
+            : {}),          /*
            * 思考等级。探测请求（`probe`）刻意**不带**它 ——
            * 探测只回答"这个端点通不通、这把钥匙对不对"，
            * 让一次连通性检查也去花思考预算是浪费。
@@ -800,7 +842,10 @@ export class LlmClient {
     options: ChatCallOptions = {},
   ): Promise<ChatResult> {
     const probe = options.probe === true;
-    const request = this.buildRequest(messages, probe, options.maxTokens);
+    const request = this.buildRequest(messages, probe, options.maxTokens, {
+      ...(options.tools !== undefined ? { tools: options.tools } : {}),
+      ...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
+    });
     /*
      * ⚠️ **OpenAI 兼容的 provider 默认走流式**（探测请求除外）。
      *
@@ -922,6 +967,8 @@ export class LlmClient {
       model: parsed.model ?? this.model,
       latencyMs,
       raw: response.body,
+      /* 原生 function calling 的产出（没有就不写这个字段 —— 见 `ChatResult.toolCalls`）。 */
+      ...(parsed.toolCalls !== undefined ? { toolCalls: parsed.toolCalls } : {}),
     };
   }
 
@@ -931,6 +978,7 @@ export class LlmClient {
     usage: ChatResult['usage'];
     model: string | null;
     isEmpty: boolean;
+    toolCalls?: ToolCall[];
   } {
     /*
      * ⚠️ **顺序是契约：Anthropic 必须排在 `openAiCompatible` 之前。**

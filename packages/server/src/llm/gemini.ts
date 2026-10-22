@@ -6,6 +6,8 @@ import {
   type ChatMessage,
   type FinishReason,
   type OutboundRequest,
+  type ToolCall,
+  type ToolSpec,
   type WireUsage,
 } from './types.js';
 
@@ -23,6 +25,9 @@ export interface GeminiBodyOptions {
   maxTokens?: number;
   jsonMode?: boolean;
   jsonSchema?: Record<string, unknown>;
+  /** 原生 function calling 的工具清单（2026-10-23，见 `types.ts` 的 `ChatRequest.tools`）。 */
+  tools?: ToolSpec[];
+  toolChoice?: 'auto' | 'none' | 'required';
 }
 
 type JsonObject = Record<string, unknown>;
@@ -123,12 +128,57 @@ export function buildBody(
 ): JsonObject {
   const { system, messages: turns } = splitSystem(messages);
 
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   *  ⚠️ **Gemini 的工具消息形状是三家差别最大的**（2026-10-23）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * | | OpenAI | Gemini |
+   * |---|---|---|
+   * | 模型发起调用 | `message.tool_calls[]` | `parts[]` 里 `{functionCall:{name,args}}` |
+   * | 回传结果 | `role:'tool'` | `role:'user'`，parts 里 `{functionResponse:{name,response}}` |
+   * | 工具声明 | `tools:[{type:'function',…}]` | `tools:[{functionDeclarations:[…]}]` |
+   *
+   * ⚠️ **Gemini 没有 `tool` 角色**（只有 `user` / `model`）—— 工具结果要以
+   * `user` 身份、以 `functionResponse` part 的形式回传。
+   *
+   * ⚠️ **`functionResponse` 用 `name` 而不是 `id` 关联** —— 这是与 OpenAI
+   * 最大的语义差异：OpenAI 靠 `tool_call_id`，Gemini 靠**工具名**。
+   * 所以同名工具一轮内不能并行调两次（我们的工具集没有这种情况，
+   * 但若以后加了就必须改协议）。
+   */
   const body: JsonObject = {
-    contents: turns.map((m) => ({
-      // Role `model` — the string `assistant` is not a valid Gemini role.
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    })),
+    contents: turns.map((m) => {
+      if (m.role === 'tool') {
+        return {
+          role: 'user',
+          parts: [
+            {
+              functionResponse: {
+                name: m.toolName ?? m.toolCallId ?? '',
+                response: safeParseObject(m.content),
+              },
+            },
+          ],
+        };
+      }
+      if (m.role === 'assistant' && m.toolCalls !== undefined && m.toolCalls.length > 0) {
+        const parts: JsonObject[] = [];
+        if (m.content !== '') parts.push({ text: m.content });
+        for (const c of m.toolCalls) {
+          parts.push({
+            functionCall: { name: c.name, args: safeParseObject(c.arguments) },
+          });
+        }
+        // Role `model` — the string `assistant` is not a valid Gemini role.
+        return { role: 'model', parts };
+      }
+      return {
+        // Role `model` — the string `assistant` is not a valid Gemini role.
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      };
+    }),
   };
 
   if (system !== undefined) {
@@ -150,7 +200,64 @@ export function buildBody(
   }
 
   if (Object.keys(generationConfig).length > 0) body['generationConfig'] = generationConfig;
+
+  /*
+   * 原生 function calling（2026-10-23）。
+   *
+   * Gemini 的声明包在 `functionDeclarations` 里，schema 走 `parameters`，
+   * 且**必须过 `toGeminiSchema`** —— 直接丢 OpenAI 的 JSON Schema 进去会被
+   * 400 拒（`additionalProperties` / `$ref` / 大写的 `type` 都不认）。
+   *
+   * ⚠️ 与 `responseMimeType: application/json` 互斥：那边强制"只输出 JSON"，
+   * 这边要求"可以选调工具"，同时发会让模型永远不调工具。
+   */
+  if (options.tools !== undefined && options.tools.length > 0) {
+    body['tools'] = [
+      {
+        functionDeclarations: options.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parameters: toGeminiSchema(t.parameters),
+        })),
+      },
+    ];
+    /*
+     * `toolConfig.functionCallingConfig.mode`：
+     *   AUTO（默认） / ANY（必须调一个） / NONE（不许调）
+     *
+     * ⚠️ 只在 `required` 时显式写 —— `AUTO` 是默认值，写了反而多一个
+     * 网关可能不认的字段（各家兼容层对 toolConfig 的支持不一致）。
+     */
+    if (options.toolChoice === 'required') {
+      body['toolConfig'] = { functionCallingConfig: { mode: 'ANY' } };
+    } else if (options.toolChoice === 'none') {
+      body['toolConfig'] = { functionCallingConfig: { mode: 'NONE' } };
+    }
+    delete generationConfig['responseMimeType'];
+    delete generationConfig['responseSchema'];
+    if (Object.keys(generationConfig).length > 0) body['generationConfig'] = generationConfig;
+    else delete body['generationConfig'];
+  }
+
   return body;
+}
+
+/**
+ * 把工具参数字符串解析成对象；失败时返回 `{ raw: … }` 而不是抛。
+ *
+ * Gemini 要求 `args` 必须是对象。模型偶尔吐出不合法的 JSON，
+ * 那时让它抛会让**整轮决策失败**，而包成 `{raw}` 至少能让工具看到
+ * 原始输入、也让模型在下一轮知道"参数没被正确解析"。
+ */
+function safeParseObject(text: string): JsonObject {
+  if (text.trim() === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const record = asObject(parsed);
+    return record ?? { value: parsed };
+  } catch {
+    return { raw: text };
+  }
 }
 
 /**
@@ -245,6 +352,46 @@ export interface GeminiParsedResponse {
   usage: ReturnType<typeof normalizeUsage>;
   model: string | null;
   isEmpty: boolean;
+  /** 原生 function calling 的产出（2026-10-23）。`undefined` = 这一轮没调工具。 */
+  toolCalls?: ToolCall[];
+}
+
+/**
+ * 从 Gemini 的 `content.parts[]` 里取出 `functionCall` 块（2026-10-23）。
+ *
+ * ```jsonc
+ *   {"content":{"parts":[
+ *     {"text":"我先看一下…"},
+ *     {"functionCall":{"name":"get_performance","args":{"window":"7d"}}}
+ *   ]}}
+ * ```
+ *
+ * ⚠️ **Gemini 不给调用 id** —— 它是靠工具名关联结果的（见 `buildBody` 那段）。
+ * 这里合成一个稳定 id（`gemini_<i>_<name>`）填进 `ToolCall.id`，
+ * 好让上游的 `ChatMessage.toolCallId` 字段有值可放；真正回传时 Gemini 只用
+ * `toolName`。**合成 id 而不是留空**：留空会让上游的去重/匹配逻辑
+ * 把所有 Gemini 调用当成同一次。
+ */
+export function extractToolCalls(content: unknown): ToolCall[] | undefined {
+  const record = asObject(content);
+  if (!record) return undefined;
+  const parts = record['parts'];
+  if (!Array.isArray(parts)) return undefined;
+
+  const out: ToolCall[] = [];
+  for (const [index, part] of parts.entries()) {
+    const block = asObject(part);
+    if (!block) continue;
+    const call = asObject(block['functionCall']);
+    if (!call) continue;
+    const name = typeof call['name'] === 'string' ? call['name'] : '';
+    if (name === '') continue;
+    const args = call['args'];
+    const argsText =
+      typeof args === 'string' ? args : args === undefined || args === null ? '{}' : JSON.stringify(args);
+    out.push({ id: `gemini_${index}_${name}`, name, arguments: argsText });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 export function parseResponse(body: unknown, fallbackModel: string): GeminiParsedResponse {
@@ -272,6 +419,7 @@ export function parseResponse(body: unknown, fallbackModel: string): GeminiParse
 
   const content = first['content'];
   const text = extractText(content);
+  const toolCalls = extractToolCalls(content);
   // Gemini never reports `tool_calls` as a finish reason, so the parts decide.
   const finishReason: FinishReason = hasFunctionCall(content)
     ? 'tool_calls'
@@ -282,6 +430,8 @@ export function parseResponse(body: unknown, fallbackModel: string): GeminiParse
     finishReason,
     usage: normalizeUsage(asObject(root['usageMetadata']) as WireUsage | null),
     model: typeof root['modelVersion'] === 'string' ? String(root['modelVersion']) : fallbackModel,
-    isEmpty: text.trim() === '',
+    /* 只发起工具调用、没有说话，是工具循环的正常一轮 —— 不是空回复。 */
+    isEmpty: text.trim() === '' && toolCalls === undefined,
+    ...(toolCalls !== undefined ? { toolCalls } : {}),
   };
 }
