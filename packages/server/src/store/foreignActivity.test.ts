@@ -208,7 +208,7 @@ test('netSince 只算窗口内的 —— 总账校验的两侧必须比同一段
    * 总账校验拿平台侧净额比**交易所流水**，而流水是账户级的：它不区分"哪个机器人
    * 下的单"，但**严格区分哪个账户**。所以这里也要按账户取。
    */
-  const accountId = traders.get(t)!.exchangeAccountId;
+  const accountId = traders.get(t)!.exchangeAccountId!;
   const inWindow = trades.netSinceForAccount(accountId, sinceIso);
   assert.ok(inWindow < 5, `窗口内的净额应当只有那一笔（拿到 ${inWindow}）`);
   assert.ok(
@@ -257,8 +257,8 @@ test('★ netSince 按【交易所账户】求和 —— 同一账户的机器�
       source: 'bot',
     });
   }
-  const accountA = traders.get(a)!.exchangeAccountId;
-  const accountB = traders.get(b)!.exchangeAccountId;
+  const accountA = traders.get(a)!.exchangeAccountId!;
+  const accountB = traders.get(b)!.exchangeAccountId!;
   assert.notEqual(accountA, accountB, '前提：两个机器人跑在不同的交易所账户上');
 
   assert.equal(
