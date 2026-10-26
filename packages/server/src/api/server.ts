@@ -83,6 +83,7 @@ import {
 } from './auth.js';
 import { FailureThrottle, IP_THROTTLE_OPTIONS, USERNAME_THROTTLE_OPTIONS } from './loginThrottle.js';
 import { checkOutboundUrl, parseHostAllowlist } from '../llm/urlGuard.js';
+import { paperAccountState } from '../binance/paperWallet.js';
 import type { BalanceService } from '../services/balance.js';
 
 const log = createLogger('api');
@@ -247,7 +248,17 @@ const AI_MANAGED_PRESET = 'ai_managed';
 
 const TraderInputSchema = z.object({
   name: z.string().min(1).max(80),
-  exchangeAccountId: z.number().int().positive(),
+  /**
+   * 绑定的交易所账户。
+   *
+   * **可以省略 / 传 `null`** —— 那是纯模拟盘机器人（用户 2026-10-27 需求）：
+   * 它不下真实订单、余额由本地台账折算，所以不需要任何真实账户。
+   *
+   * ⚠️ 省略与 `null` 在这里是**同一个意思**（都是"没有账户"），因为创建时
+   * 没有"保持原值"这个语义（那是 PATCH 才有的事）。但实盘启动时服务端会
+   * 明确拒绝没有账户的机器人 —— 见 `manager.connectionFor`。
+   */
+  exchangeAccountId: z.number().int().positive().nullable().optional(),
   aiModelId: z.number().int().positive(),
   /**
    * 引用的策略 —— **AI 托管模式不需要它，传 `null`（或省略）**。
@@ -270,6 +281,19 @@ const TraderInputSchema = z.object({
    * silently disagree with the account and make every return figure wrong.
    */
   initialEquity: z.number().min(0).optional(),
+  /**
+   * **模拟盘起始余额**（用户 2026-10-27 需求）。
+   *
+   * 用户原话：「模拟盘不应该根据真实钱包的余额，而应该可以自定义模拟盘的余额」。
+   *
+   * 省略 / 0 = 不指定：服务端回落到 `initialEquity`，再回落到 1000。
+   * 只有模拟盘会读它；实盘忽略（它读交易所）。
+   *
+   * ⚠️ 与 `initialEquity` 分开传：后者是"收益率的分母"且会被真实余额覆盖，
+   * 而这个是模拟账户的本金、永不被覆盖。混成一个字段会出现"我填了 5000，
+   * 启动后变成 12.34"这种没人能解释的现象。
+   */
+  paperStartingBalance: z.number().min(0).optional(),
   /**
    * 运行模式。
    *
@@ -2031,8 +2055,15 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   app.post('/api/traders', authed, guard(async (body: unknown) => {
     const parsed = TraderInputSchema.safeParse(body);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'Invalid trader');
-    const account = exchanges.get(parsed.data.exchangeAccountId);
-    if (!account) throw new Error('未知的交易所账户');
+    /*
+     * **账户是可选的**（用户 2026-10-27 需求）：不传 = 纯模拟盘机器人，
+     * 它不需要任何真实交易所账户。传了就必须真实存在 —— 一个打错的 id
+     * 会让"绑了账户"这件事变成一句空话。
+     */
+    const requestedAccountId = parsed.data.exchangeAccountId ?? null;
+    const account =
+      requestedAccountId === null ? null : exchanges.get(requestedAccountId);
+    if (requestedAccountId !== null && !account) throw new Error('未知的交易所账户');
     /*
      * ⚠️ **团队模式不校验 `ai_model_id`** —— 它**不使用**这个字段（用户 2026-10-12 要求）。
      *
@@ -2100,10 +2131,30 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
       if (!strategies.get(requestedStrategyId)) throw new Error('未知的策略');
     }
 
-    // Seed the return baseline from the exchange rather than from a typed number.
+    /*
+     * ── 起始权益 / 模拟盘本金 ────────────────────────────────────────────
+     *
+     * 两条**互相独立**的路径：
+     *
+     *   · **模拟盘**（没有账户，或操作员填了 `paperStartingBalance`）：
+     *     本金就是操作员填的那个数 —— **不去读任何真实钱包**。这正是用户说的
+     *     「模拟盘不应该根据真实钱包的余额」。
+     *   · **实盘**：沿用原来的行为，从交易所读真实余额做收益率分母。
+     */
+    const paperStartingBalance = parsed.data.paperStartingBalance ?? 0;
+    const isPaperOnly = account === null;
+
     let initialEquity = parsed.data.initialEquity ?? 0;
-    let equitySource: 'exchange' | 'manual' | 'unavailable' = 'manual';
-    if (initialEquity <= 0) {
+    let equitySource: 'exchange' | 'manual' | 'paper' | 'unavailable' = 'manual';
+
+    if (isPaperOnly) {
+      /*
+       * 没有账户 → **不可能**读真实余额。用操作员填的模拟本金；
+       * 没填就留 0，由 `manager` 在首次启动时回落到默认值。
+       */
+      if (initialEquity <= 0) initialEquity = paperStartingBalance;
+      equitySource = initialEquity > 0 ? 'paper' : 'unavailable';
+    } else if (account && initialEquity <= 0) {
       const live = await deps.balance.walletBalanceOf(account.id);
       if (live !== null && live > 0) {
         initialEquity = live;
@@ -2113,9 +2164,13 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
       }
     }
 
+    /* 模拟本金没单独填时，用 `initialEquity` 兜底 —— 两者语义不同，但都比 0 好。 */
+    const effectivePaperBalance = paperStartingBalance > 0 ? paperStartingBalance : initialEquity;
+
     const trader = traders.create({
       name: parsed.data.name,
-      exchangeAccountId: parsed.data.exchangeAccountId,
+      /* `null` = 纯模拟盘机器人（没有真实交易所账户）。 */
+      exchangeAccountId: requestedAccountId,
       /*
        * ⚠️ **团队模式写入一个占位 `aiModelId`** —— 因为 `traders.ai_model_id` 是
        * `NOT NULL` + 外键（建表时就定了），而团队模式**不使用**这个字段
@@ -2154,6 +2209,7 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
       strategyId: requestedStrategyId,
       cycleIntervalMinutes: parsed.data.cycleIntervalMinutes,
       initialEquity,
+      paperStartingBalance: effectivePaperBalance,
       mode: parsed.data.mode,
     });
 
@@ -2644,6 +2700,12 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
    */
   const openReadOnlyFor = async (trader: Trader): Promise<ExchangeConnection | null> => {
     if (deps.openReadOnlyConnection) return deps.openReadOnlyConnection();
+    /*
+     * 纯模拟盘机器人没有交易所账户（用户 2026-10-27 需求）——
+     * 没有凭据行就是"读不到账户事实"，返回 null，由调用方按"读不到"处理
+     * （模拟盘的持仓本来就来自本地台账，不依赖这条连接）。
+     */
+    if (trader.exchangeAccountId === null) return null;
     const row = exchanges.getWithSecret(trader.exchangeAccountId);
     if (!row) return null;
     const { connectExchange } = await import('../binance/bootstrap.js');
@@ -2664,16 +2726,58 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
   /**
    * **账户读数（尽力而为）** —— 读不到就 `null`，绝不让它影响持仓那一路。
    *
-   * 为什么需要它：模拟盘的**持仓**不来自交易所，但**账户余额**仍然只能问交易所
-   * （那是账户级事实，与哪个机器人在跑无关）。两件事的来源不同，失败方式也就
-   * 必须分开 —— 一次网络抖动不该让"持仓"跟着变空（那正是用户报的那个 BUG）。
+   * ## 模拟盘读本地钱包，实盘读交易所（用户 2026-10-27 需求）
+   *
+   * 原来的注释写的是"模拟盘的持仓不来自交易所，但账户余额仍然只能问交易所" ——
+   * 那是旧的设计。用户明确要求「模拟盘不应该根据真实钱包的余额，而应该可以
+   * 自定义模拟盘的余额」，所以现在模拟盘的账户读数由**本地台账**折算：
+   *
+   * ```
+   *   walletBalance = 模拟起始余额 + 已实现净盈亏
+   *   unrealizedPnl = Σ 各持仓按标记价算出的浮盈
+   * ```
+   *
+   * 这与交易循环里 `paperAccountStateOf()` 用的是**同一套数字**，所以控制台看到的
+   * 余额与机器人决策时看到的余额不会打架。
+   *
+   * ⚠️ 纯模拟盘（`exchangeAccountId === null`）**根本没有账户可问** ——
+   * 走旧路径会永远返回 `null`，界面上显示成"读不到余额"，看起来像坏了。
    */
   const readAccountBestEffort = async (trader: Trader): Promise<ExchangeAccountState | null> => {
     try {
+      if (isPaperTrader(trader.id)) {
+        /*
+         * 浮盈要按标记价算 —— 与 `paperMarkPrices()` 同一来源（公开行情，
+         * 不需要该账户有凭据）。
+         */
+        const local = positionStore.open(trader.id);
+        const marks = await paperMarkPrices(local);
+        const starting = deps.manager.paperStartingBalanceOf(trader.id);
+        const realized = tradeStore.lifetimeNetPnl(trader.id);
+        let unrealizedPnl = 0;
+        let marginUsed = 0;
+        for (const position of local) {
+          marginUsed += Number.isFinite(position.margin_used) ? position.margin_used : 0;
+          const mark = marks.get(position.symbol);
+          if (mark === undefined) continue;
+          const diff =
+            position.side === 'long'
+              ? (mark - position.entry_price) * position.quantity
+              : (position.entry_price - mark) * position.quantity;
+          if (Number.isFinite(diff)) unrealizedPnl += diff;
+        }
+        return paperAccountState({ startingBalance: starting, realizedPnl: realized, unrealizedPnl, marginUsed });
+      }
       const connection = await openReadOnlyFor(trader);
       if (!connection) return null;
       return await connection.broker.getAccountState();
-    } catch {
+    } catch (error) {
+      /*
+       * 不静默：账户读数失败要留下原因。
+       * 原来这里是空 `catch`，于是"为什么余额是空的"完全无法从日志判断 ——
+       * 而这正是模拟盘刚接上本地钱包时最容易出错的地方（字段名、单位、空值）。
+       */
+      log.warn(`[trader ${trader.id}] 账户读数失败：${(error as Error).message}`);
       return null;
     }
   };

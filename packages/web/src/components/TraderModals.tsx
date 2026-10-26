@@ -85,7 +85,25 @@ export function NewTraderModal({
   const [catalog, setCatalog] = useState<Catalog | null>(null);
 
   const [name, setName] = useState('');
+  /**
+   * 绑定的交易所账户。
+   *
+   * ⚠️ **`''` 现在是一个有意义的取值**（用户 2026-10-27 需求）：
+   * 它表示"不绑账户"= 纯模拟盘机器人。这类机器人不下真实订单、余额由本地台账
+   * 折算，所以不需要任何真实交易所账户。
+   *
+   * 原先 `''` 只是"还没选"的中间态，而提交按钮会因为 `missing` 里有
+   * 「交易所凭证」而禁用 —— 于是"想先拿模拟盘试试"被卡在"先去交易所注册"。
+   */
   const [exchangeAccountId, setExchangeAccountId] = useState<number | ''>('');
+  /**
+   * **模拟盘起始余额**（USDT）。空字符串 = 用默认值（1000）。
+   *
+   * 用户原话：「模拟盘不应该根据真实钱包的余额，而应该可以自定义模拟盘的余额」。
+   *
+   * 只有模拟盘会用它 —— 实盘机器人读交易所余额，这个输入框在实盘下不显示。
+   */
+  const [paperBalance, setPaperBalance] = useState<string>('1000');
   const [aiModelId, setAiModelId] = useState<number | ''>('');
   /*
    * 两级选择的中间态 —— 见下面「AI 模型」那一栏上的说明。
@@ -157,7 +175,18 @@ export function NewTraderModal({
         setModels(modelRows);
         setStrategyList(strategyRows.map((s) => ({ id: s.id, name: s.name })));
         setCatalog(catalog);
-        if (accountRows[0]) setExchangeAccountId(accountRows[0].id);
+        /*
+         * ⚠️ **默认不绑账户（纯模拟盘）**（用户 2026-10-27 需求）。
+         *
+         * 原来这里是 `if (accountRows[0]) setExchangeAccountId(accountRows[0].id)` ——
+         * 自动选中第一条真实凭证。而模拟盘是**默认的运行模式**（启动时才选，
+         * 默认 dryRun=true），于是一个"默认配置"的机器人会绑上一个它根本不会
+         * 用的账户，还让操作员以为余额来自那里。
+         *
+         * 现在默认是"不绑账户"，要绑账户由操作员显式选 ——
+         * 与"实盘必须显式要求"是同一条纪律：**危险的那条路要人自己走过去**。
+         */
+        setExchangeAccountId('');
         /*
          * 预选服务端指定的默认模型，而不是"列表第一个"。
          *
@@ -297,11 +326,18 @@ export function NewTraderModal({
 
   const missing = useMemo(() => {
     const gaps: string[] = [];
-    if (accounts && accounts.length === 0) gaps.push('交易所凭证');
+    /*
+     * ⚠️ **交易所凭证不再是"缺少"项**（用户 2026-10-27 需求）。
+     *
+     * 原来这里写的是 `if (accounts.length === 0) gaps.push('交易所凭证')` ——
+     * 于是没有凭证就**根本建不了机器人**，连纯模拟盘都不行。
+     * 现在模拟盘不需要账户，所以凭证是**可选的**：
+     * 下拉里始终有「不绑账户（纯模拟盘）」这一项。
+     */
     if (models && models.length === 0) gaps.push('AI 模型');
     if (strategyList && strategyList.length === 0) gaps.push('策略');
     return gaps;
-  }, [accounts, models, strategyList]);
+  }, [models, strategyList]);
 
   const submit = async () => {
     setError(null);
@@ -311,7 +347,16 @@ export function NewTraderModal({
      * 校验按 `modelChoice` 而不是 `aiModelId` —— 选了"厂商建议"里的模型时
      * `aiModelId` 还是空的（它的记录要等到下面才建）。
      */
-    if (exchangeAccountId === '' || modelChoice === '' || strategyId === '') return setError('请选择凭证、模型与策略。');
+    /*
+     * ⚠️ **`exchangeAccountId` 不再参与校验**（用户 2026-10-27 需求）：
+     * 留空 = 纯模拟盘机器人，是合法选择。
+     */
+    if (modelChoice === '' || strategyId === '') return setError('请选择模型与策略。');
+    /* 模拟余额填了就必须是个正数 —— 否则静默回落成默认值，用户以为生效了。 */
+    const paperAmount = paperBalance.trim() === '' ? 0 : Number(paperBalance);
+    if (paperBalance.trim() !== '' && (!Number.isFinite(paperAmount) || paperAmount <= 0)) {
+      return setError('模拟盘起始余额必须是一个大于 0 的数字。');
+    }
 
     setBusy(true);
     try {
@@ -346,7 +391,12 @@ export function NewTraderModal({
       const manualEquity = equityPayload(equity);
       const trader = await api.createTrader({
         name: name.trim(),
-        exchangeAccountId: Number(exchangeAccountId),
+        /*
+         * `''` → `null`：不绑账户 = 纯模拟盘机器人（用户 2026-10-27 需求）。
+         * 传 `null` 而不是省略，是为了让"我没有账户"这件事**显式**地送到服务端
+         * （省略与 null 在创建语义上等价，但显式写出来，读代码的人不用猜）。
+         */
+        exchangeAccountId: exchangeAccountId === '' ? null : Number(exchangeAccountId),
         aiModelId: resolvedModelId,
         /*
          * ⚠️ **AI 托管必须传 `null`，不能传下拉框里选中的那个 id。**
@@ -367,6 +417,14 @@ export function NewTraderModal({
         // Omitted unless the operator took over: the server then reads the real
         // wallet balance itself. `undefined` drops the key from the JSON body.
         ...(manualEquity !== undefined ? { initialEquity: manualEquity } : {}),
+        /*
+         * 模拟盘本金（用户 2026-10-27 需求）。
+         * 只在**不绑账户**时发送 —— 绑了账户的机器人仍按原来的方式读真实余额，
+         * 那样它的收益率分母与账户一致（既有行为一个字节都不变）。
+         */
+        ...(exchangeAccountId === '' && paperAmount > 0
+          ? { paperStartingBalance: paperAmount }
+          : {}),
       });
 
       if (trader.equitySource === 'unavailable') {
@@ -463,8 +521,22 @@ export function NewTraderModal({
           </Field>
 
           <div className="grid grid-cols-2 gap-3">
-            <Field label="交易所凭证">
-              <Select value={exchangeAccountId} onChange={(e) => setExchangeAccountId(Number(e.target.value))}>
+            <Field
+              label="交易所凭证"
+              hint="留空 = 纯模拟盘，不需要任何真实账户。"
+            >
+              <Select
+                value={exchangeAccountId}
+                onChange={(e) =>
+                  setExchangeAccountId(e.target.value === '' ? '' : Number(e.target.value))
+                }
+              >
+                {/*
+                  ⚠️ **「不绑账户」必须是第一个选项，且是默认值**（用户 2026-10-27 需求）。
+                  它表示纯模拟盘机器人：不下真实订单、余额由本地台账折算。
+                  没有这一项时，没有凭证的用户根本进不了创建流程。
+                */}
+                <option value="">不绑账户（纯模拟盘）</option>
                 {accounts?.map((account) => (
                   <option key={account.id} value={account.id}>
                     {account.label} · {account.testnet ? '测试网' : '主网'}
@@ -819,8 +891,32 @@ export function NewTraderModal({
             <NumberInput value={cycleIntervalMinutes} onValueChange={setCycleIntervalMinutes} step={1} />
           </Field>
 
-          {/* 起始权益 is read from the selected credential, not typed -------- */}
-          <EquitySourceField state={equity} />
+          {/*
+            起始权益的来源分两种（用户 2026-10-27 需求）：
+
+              · **绑了账户** → 从该凭证读真实钱包余额（既有行为，一个字节不变）；
+              · **没绑账户** → 操作员**自己填**模拟盘起始余额。
+                这就是用户说的「模拟盘不应该根据真实钱包的余额，
+                而应该可以自定义模拟盘的余额」。
+
+            ⚠️ 两种情况**不能**都显示 —— 一个"读交易所"的只读控件出现在
+            纯模拟盘机器人上会让人以为余额仍然来自真实账户。
+          */}
+          {exchangeAccountId === '' ? (
+            <Field
+              label="模拟盘起始余额（USDT）"
+              hint="纯模拟盘的本金，与任何真实账户无关。收益率以它为分母。"
+            >
+              <TextInput
+                value={paperBalance}
+                onChange={(e) => setPaperBalance(e.target.value)}
+                inputMode="decimal"
+                placeholder="1000"
+              />
+            </Field>
+          ) : (
+            <EquitySourceField state={equity} />
+          )}
 
           {baselineWarning && (
             <div className="rounded-md border border-warn/50 bg-warn/10 px-3 py-2 text-base text-warn">

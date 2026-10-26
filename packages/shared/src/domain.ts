@@ -202,7 +202,24 @@ export type TraderStatus = 'running' | 'stopped' | 'starting' | 'error' | 'safe_
 export interface Trader {
   id: number;
   name: string;
-  exchangeAccountId: number;
+  /**
+   * 绑定的交易所账户 —— **`null` 表示这是一台纯模拟盘机器人**。
+   *
+   * ## 为什么它可以为空（用户 2026-10-27 需求）
+   *
+   * 用户原话：「模拟盘不应该根据真实钱包的余额，而应该可以自定义模拟盘的余额。
+   * 也就是说，无需真实账户就能开启模拟盘机器人。」
+   *
+   * 模拟盘不下真实订单（`BinanceBroker` 的 dryRun 分支全程本地模拟），
+   * 余额也由本地台账折算（见 `binance/paperWallet.ts`），所以它**不需要**
+   * 任何真实账户。原先这一列是 `NOT NULL`，于是"想先拿模拟盘试试"被卡在
+   * "先去交易所注册、拿密钥、填进系统"这一步。
+   *
+   * ⚠️ **实盘机器人必须有值**：`null` 的机器人启动时会被明确拒绝
+   *（它没有凭据可用）。删掉一个交易所账户时，引用它的机器人被置空
+   *（`ON DELETE SET NULL`），而不是把机器人连同账本一起删掉。
+   */
+  exchangeAccountId: number | null;
   aiModelId: number;
   /**
    * 这个机器人引用的策略 —— **`null` 表示它不依赖任何策略**。
@@ -224,7 +241,22 @@ export interface Trader {
   strategyId: number | null;
   /** Minutes between decision cycles. */
   cycleIntervalMinutes: number;
+  /**
+   * 收益率的分母。
+   *
+   * ⚠️ 它**不是**"账户里有多少钱" —— 那个语义归 `paperStartingBalance`（模拟盘）
+   * 或交易所余额（实盘）。两者分开存是刻意的：`initialEquity` 会在首次启动时
+   * 被真实钱包余额覆盖（见 `manager.ts` 的回落逻辑），而操作员填的模拟余额
+   * **不该**被任何东西覆盖。
+   */
   initialEquity: number;
+  /**
+   * 模拟盘起始余额（操作员在创建时填的那个数）。`0` = 没填。
+   *
+   * 只对模拟盘有意义：它是本地钱包的本金，`walletBalance = 起始余额 + 已实现净盈亏`。
+   * 实盘机器人忽略这个字段（它读交易所）。
+   */
+  paperStartingBalance: number;
   status: TraderStatus;
   /** Populated while running. */
   lastCycleAt: string | null;

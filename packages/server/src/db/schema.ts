@@ -896,6 +896,94 @@ const M18_TRADER_DRY_RUN = /* sql */ `
 ALTER TABLE traders ADD COLUMN dry_run INTEGER;
 `;
 
+/*
+ * 模拟盘机器人**不再需要真实交易所账户**（用户 2026-10-27 需求）。
+ *
+ * ## 用户的原话
+ *
+ *   「创建模拟盘的时候，不应该只需要绑定钱包。还有，模拟盘不应该根据真实钱包的
+ *    余额，而应该可以自定义模拟盘的余额。也就是说，无需真实账户就能开启模拟盘机器人。」
+ *
+ * ## 原先的两个约束造成的局面
+ *
+ *   exchange_account_id INTEGER NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT
+ *
+ *   · **NOT NULL** → 建模拟盘机器人时**必须**先绑一个真实交易所账户，
+ *     而模拟盘根本不会向那个账户下单（`BinanceBroker` 的 dryRun 分支全程本地模拟）；
+ *   · 于是"想先拿模拟盘试试"这件本该零门槛的事，被卡在"先去币安注册、拿密钥、
+ *     填进系统"这一步 —— 而绝大多数人在那一步就放弃了。
+ *
+ * ## 为什么改可空是安全的
+ *
+ * 模拟盘的**持仓、下单、保护单**本来就全部走本地台账 + `BinanceBroker` 的模拟分支，
+ * 唯一真正读交易所的地方是 `getAccountState()`（账户余额），而它现在可以由
+ * 本地台账折算（见 `binance/paperWallet.ts` 与 `BinanceBroker.paperAccount`）。
+ *
+ * 实盘路径**一个字节都没变**：`exchangeAccountId` 为空的机器人在启动时会被明确
+ * 拒绝（它没有凭据可用），见 `manager.connectionFor` 的校验。
+ *
+ * ## 为什么是 SET NULL 而不是 CASCADE
+ *
+ * 删掉一个交易所账户时不该连带删掉机器人 —— CASCADE 会删掉它的成交、持仓与
+ * 决策记录，**而那是账本**。置空之后实盘机器人启动会给出明确错误，模拟盘机器人
+ * 则完全不受影响（它本来就不需要那个账户）。
+ *
+ * ## 新增列 `paper_starting_balance`
+ *
+ * 操作员填的模拟盘起始余额。`0` = 没填（回落到 `initial_equity`，再回落到默认值）。
+ *
+ * ⚠️ 为什么不直接复用 `initial_equity`：后者的语义是"收益率的分母"，而它
+ * **会在首次启动时被真实钱包余额覆盖**（`manager.ts` 里那段 `initialEquity <= 0`
+ * 的回落逻辑）。两个语义不同的东西共用一个字段，就会出现"我填了 5000，
+ * 启动后变成 12.34"这种没人能解释的现象。分开存，各自只做一件事。
+ */
+const M19_PAPER_TRADING = /* sql */ `
+-- ---------------------------------------------------------------------------
+-- 重建 traders 表：exchange_account_id 允许为空 + 新增模拟盘起始余额
+--
+-- ⚠️ 下面的列顺序必须与迁移前**逐字一致** —— INSERT ... SELECT 是按位置对应的。
+-- 顺序取自 M18 之后的 PRAGMA table_info(traders)：
+--   id, name, exchange_account_id, ai_model_id, strategy_id, cycle_interval_minutes,
+--   initial_equity, status, last_cycle_at, last_cycle_number, last_error,
+--   consecutive_failures, created_at, updated_at, agent_config_json, mode, dry_run
+-- ---------------------------------------------------------------------------
+CREATE TABLE traders_new (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                   TEXT    NOT NULL,
+  -- ⚠️ 本次唯一的实质改动：去掉 NOT NULL，RESTRICT 换成 SET NULL。
+  exchange_account_id    INTEGER          REFERENCES exchange_accounts(id) ON DELETE SET NULL,
+  ai_model_id            INTEGER NOT NULL REFERENCES ai_models(id) ON DELETE RESTRICT,
+  strategy_id            INTEGER          REFERENCES strategies(id) ON DELETE SET NULL,
+  cycle_interval_minutes INTEGER NOT NULL DEFAULT 15,
+  initial_equity         REAL    NOT NULL DEFAULT 0,
+  status                 TEXT    NOT NULL DEFAULT 'stopped',
+  last_cycle_at          TEXT,
+  last_cycle_number      INTEGER NOT NULL DEFAULT 0,
+  last_error             TEXT,
+  consecutive_failures   INTEGER NOT NULL DEFAULT 0,
+  created_at             TEXT    NOT NULL,
+  updated_at             TEXT    NOT NULL,
+  agent_config_json      TEXT,
+  mode                   TEXT    NOT NULL DEFAULT 'strategy',
+  dry_run                INTEGER,
+  -- 新增列放最后，避免影响上面按位置对应的 INSERT ... SELECT。
+  paper_starting_balance REAL    NOT NULL DEFAULT 0
+);
+INSERT INTO traders_new (
+  id, name, exchange_account_id, ai_model_id, strategy_id, cycle_interval_minutes,
+  initial_equity, status, last_cycle_at, last_cycle_number, last_error,
+  consecutive_failures, created_at, updated_at, agent_config_json, mode, dry_run
+)
+SELECT
+  id, name, exchange_account_id, ai_model_id, strategy_id, cycle_interval_minutes,
+  initial_equity, status, last_cycle_at, last_cycle_number, last_error,
+  consecutive_failures, created_at, updated_at, agent_config_json, mode, dry_run
+FROM traders;
+DROP TABLE traders;
+ALTER TABLE traders_new RENAME TO traders;
+CREATE INDEX idx_traders_status ON traders(status);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'initial', sql: M1_INITIAL },
   { version: 2, name: 'trade-accounting', sql: M2_TRADE_ACCOUNTING },
@@ -921,4 +1009,11 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 16, name: 'trade-intel-attribution', sql: M16_TRADE_INTEL_ATTRIBUTION },
   { version: 17, name: 'position-intel-attribution', sql: M17_POSITION_INTEL_ATTRIBUTION },
   { version: 18, name: 'trader-dry-run', sql: M18_TRADER_DRY_RUN },
+  {
+    version: 19,
+    name: 'paper-trading',
+    sql: M19_PAPER_TRADING,
+    /* 重建被引用的表 —— 必须在事务外关外键，否则 DROP 会级联删掉子表数据。 */
+    detachForeignKeys: true,
+  },
 ];

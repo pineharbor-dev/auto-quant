@@ -18,9 +18,10 @@ import { createJevDecisionModel } from './jevModel.js';
 import { createLogger } from '../logger.js';
 import { env } from '../env.js';
 import { MarketDataService } from '../market/service.js';
+import { paperAccountState } from '../binance/paperWallet.js';
 import { LlmClient } from '../llm/client.js';
 import { discoverModels } from '../llm/discovery.js';
-import { aiModels, equity, exchanges, positions, runtimeLogs, settings, strategies, traders } from '../store/repositories.js';
+import { aiModels, equity, exchanges, positions, runtimeLogs, settings, strategies, trades as tradeStore, traders } from '../store/repositories.js';
 import { eventBus } from '../events.js';
 import { checkConfigReachability } from '../risk/reachability.js';
 import { AgentRuntime } from './agent/runtime.js';
@@ -258,6 +259,15 @@ export function recordLlmHealth(aiModelId: number, health: LlmHealth): void {
  * 又点不动按钮**，比一个明确的失败更糟。
  */
 const START_WATCHDOG_MS = 90_000;
+
+/**
+ * 模拟盘没有填起始余额时的默认本金（USDT）。
+ *
+ * 为什么不是 0：0 余额会让每一笔开仓都被「保证金不足」拒掉，而界面上看起来
+ * 只是「机器人一直不交易」—— 与仓库里反复记录的那类"静默失能"同一个形状。
+ * 1000 与 `simulate.ts` 的夹具、`seedDemoData.ts` 的常见档位一致。
+ */
+const DEFAULT_PAPER_BALANCE = 1000;
 
 /**
  * 连接缓存的键：**同一台机器人的"模拟盘"与"实盘"是两条不同的连接。**
@@ -1802,10 +1812,93 @@ export class TraderManager {
     return this.running.get(traderId)?.nextCycleAt ?? null;
   }
 
-  /** Resolve an exchange account into a live connection, reusing it if present. */
+  /**
+   * **模拟盘账户读数** —— 由本地台账折算，不碰交易所。
+   *
+   * ## 余额怎么来（用户 2026-10-27 需求）
+   *
+   * 用户原话：「模拟盘不应该根据真实钱包的余额，而应该可以自定义模拟盘的余额」。
+   *
+   * ```
+   *   walletBalance = 起始余额 + 已实现净盈亏
+   *   unrealizedPnl = Σ 各持仓按标记价算出的浮盈
+   *   marginUsed    = Σ 各持仓占用的保证金
+   * ```
+   *
+   * 三个数**全部**来自本地台账，逐笔可核对 —— 与「账是可核对的」那条口径一致。
+   *
+   * ## 为什么浮盈要按**标记价**实时算
+   *
+   * 持仓行里存的是入场价与数量，浮盈必须用当前标记价才准。这里走
+   * `this.running` 里那个 AutoTrader 的行情服务；机器人还没起来时（比如对账路径）
+   * 拿不到标记价，就**按 0 计** —— 宁可少算浮盈，也不要凭空造一个价格。
+   * 调用方（`connectionFor`）只在**运行中**才会读到这个函数，所以那种情况很少。
+   *
+   * ## 起始余额的回落顺序
+   *
+   *   `paper_starting_balance` → `initial_equity` → 默认 1000
+   *
+   * 老机器人（迁移前创建的）两个字段都可能为 0，回落给一个能开仓的默认值，
+   * 而不是 0 —— 0 余额会让每一笔开仓都被「保证金不足」拒掉，看起来像功能坏了。
+   */
+  /**
+   * 这台机器人**模拟盘本金的权威值**（`paper_starting_balance` → `initial_equity` → 默认）。
+   *
+   * 公开给 API 层：控制台的「账户」页要显示与机器人决策时**完全一样**的余额，
+   * 否则两边会各算一套、然后对不上。回落顺序与 `paperAccountStateOf` 必须一致 ——
+   * 所以只在这里实现一次，两处都调它。
+   */
+  paperStartingBalanceOf(traderId: number): number {
+    const trader = traders.get(traderId);
+    const explicit = trader?.paperStartingBalance ?? 0;
+    if (explicit > 0) return explicit;
+    const fallback = trader?.initialEquity ?? 0;
+    if (fallback > 0) return fallback;
+    return DEFAULT_PAPER_BALANCE;
+  }
+
+  private paperAccountStateOf(traderId: number): ReturnType<typeof paperAccountState> {
+    const startingBalance = this.paperStartingBalanceOf(traderId);
+    const realizedPnl = tradeStore.lifetimeNetPnl(traderId);
+
+    /* 浮盈与保证金：只有运行中的机器人拿得到标记价。 */
+    let unrealizedPnl = 0;
+    let marginUsed = 0;
+    const live = this.running.get(traderId);
+    const marks = live ? live.paperMarkPrices() : new Map<string, number>();
+    for (const position of positions.open(traderId)) {
+      marginUsed += Number.isFinite(position.margin_used) ? position.margin_used : 0;
+      const mark = marks.get(position.symbol);
+      if (mark === undefined) continue;
+      const quantity = position.quantity;
+      const entry = position.entry_price;
+      const diff =
+        position.side === 'LONG' ? (mark - entry) * quantity : (entry - mark) * quantity;
+      if (Number.isFinite(diff)) unrealizedPnl += diff;
+    }
+
+    return paperAccountState({ startingBalance, realizedPnl, unrealizedPnl, marginUsed });
+  }
+
+  /**
+   * Resolve an exchange account into a live connection, reusing it if present.
+   *
+   * ## `exchangeAccountId === null` —— 纯模拟盘机器人（用户 2026-10-27 需求）
+   *
+   * 模拟盘不需要真实账户：它不下真实订单（`BinanceBroker` 的 dryRun 分支全程本地
+   * 模拟），余额由本地台账折算（`binance/paperWallet.ts`）。所以这里在**没有账户**
+   * 且 `dryRun` 为真时，建一条**只有公开行情**的连接（`connectExchange` 本来就允许
+   * 不传凭据 —— 它只做校时与 `exchangeInfo`，都不需要签名）。
+   *
+   * 再给 broker 挂上 `paperAccount`：`getAccountState()` 从此读本地台账，
+   * 而不是发一次签名的 `/fapi/v3/account`。
+   *
+   * ⚠️ **`dryRun` 为假时无账户一律拒绝**：那是"要下真单却没有凭据"，
+   * 必须明确报错，绝不能静默降级成模拟盘（那会让操作员以为在下真单）。
+   */
   private async connectionFor(
     traderId: number,
-    exchangeAccountId: number,
+    exchangeAccountId: number | null,
     dryRun: boolean,
   ): Promise<ExchangeConnection> {
     /*
@@ -1828,6 +1921,26 @@ export class TraderManager {
     const existing = this.connections.get(cacheKey);
     if (existing) return existing;
 
+    /* --- 纯模拟盘：没有账户，只要一条公开行情连接 + 本地钱包 --------- */
+    if (exchangeAccountId === null) {
+      if (!dryRun) {
+        throw new Error(
+          '这台机器人没有绑定交易所账户，只能以模拟盘运行。' +
+            '要跑实盘，请先在「交易所」页添加凭证并在创建/编辑时绑定。',
+        );
+      }
+      const connection = await connectExchange({
+        /* 模拟盘没有账户，就用 Demo 的公开行情端点（它不需要任何凭据）。 */
+        environment: 'demo',
+        dryRun: true,
+        quiet: true,
+        paperAccount: () => this.paperAccountStateOf(traderId),
+        ...(process.env.BINANCE_WS_HOST ? { wsHostOverride: process.env.BINANCE_WS_HOST } : {}),
+      });
+      this.connections.set(cacheKey, connection);
+      return connection;
+    }
+
     const account = exchanges.getWithSecret(exchangeAccountId);
     if (!account) throw new Error(`找不到交易所账户 ${exchangeAccountId}`);
 
@@ -1841,6 +1954,12 @@ export class TraderManager {
       apiKey,
       apiSecret,
       dryRun,
+      /*
+       * 模拟盘即使**绑定了真实账户**，账户读数也走本地台账 —— 否则模拟盘会看到
+       * 真金白银的余额，而它下的单在交易所根本不存在，两边永远对不上。
+       * 这正是用户说的「模拟盘不应该根据真实钱包的余额」。
+       */
+      ...(dryRun ? { paperAccount: () => this.paperAccountStateOf(traderId) } : {}),
       /*
        * **不给每个机器人刷两条启动日志。**
        *

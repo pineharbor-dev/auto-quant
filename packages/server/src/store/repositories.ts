@@ -528,6 +528,8 @@ interface TraderRow {
    * 这一列是一条**安全修复**，不是便利性字段。
    */
   dry_run: number | null;
+  /** 模拟盘起始余额。`0` = 没填（回落到 `initial_equity`）。见 M19。 */
+  paper_starting_balance: number;
   created_at: string;
   updated_at: string;
 }
@@ -554,6 +556,7 @@ function toTrader(row: TraderRow): Trader {
      * "操作员指定了实盘"，env 的回落路径就被悄悄删掉了。
      */
     dryRun: row.dry_run === null ? undefined : row.dry_run !== 0,
+    paperStartingBalance: row.paper_starting_balance ?? 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -571,7 +574,14 @@ export const traders = {
 
   create(input: {
     name: string;
-    exchangeAccountId: number;
+    /**
+     * 绑定的交易所账户。
+     *
+     * **模拟盘机器人可以是 `null`**（用户 2026-10-27 需求）——
+     * 它不下真实订单、余额由本地台账折算，所以不需要任何真实账户。
+     * 实盘机器人必须给一个真实 id，由启动路径校验。
+     */
+    exchangeAccountId: number | null;
     aiModelId: number;
     /**
      * 引用的策略。**AI 托管（`mode: 'ai_managed'`）传 `null`** ——
@@ -590,11 +600,18 @@ export const traders = {
      * 只能靠读这行代码发现。
      */
     mode?: TraderMode;
+    /**
+     * 模拟盘起始余额（操作员填的那个数）。省略 = `0` = 回落到 `initialEquity`。
+     *
+     * ⚠️ 与 `initialEquity` **不是一回事**：后者是"收益率的分母"，且会在首次启动时
+     * 被真实钱包余额覆盖；这个字段是"模拟账户里有多少钱"，只给模拟盘用、永不被覆盖。
+     */
+    paperStartingBalance?: number;
   }): Trader {
     const ts = now();
     const { lastInsertRowid } = getDb().run(
-      `INSERT INTO traders (name, exchange_account_id, ai_model_id, strategy_id, cycle_interval_minutes, mode, initial_equity, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)`,
+      `INSERT INTO traders (name, exchange_account_id, ai_model_id, strategy_id, cycle_interval_minutes, mode, initial_equity, paper_starting_balance, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)`,
       input.name,
       input.exchangeAccountId,
       input.aiModelId,
@@ -602,6 +619,7 @@ export const traders = {
       input.cycleIntervalMinutes,
       input.mode ?? 'strategy',
       input.initialEquity,
+      input.paperStartingBalance ?? 0,
       ts,
       ts,
     );
@@ -616,12 +634,13 @@ export const traders = {
       strategyId: number | null;
       cycleIntervalMinutes: number;
       initialEquity: number;
+      paperStartingBalance: number;
     }>,
   ): void {
     const current = this.get(id);
     if (!current) return;
     getDb().run(
-      `UPDATE traders SET name = ?, ai_model_id = ?, strategy_id = ?, cycle_interval_minutes = ?, initial_equity = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE traders SET name = ?, ai_model_id = ?, strategy_id = ?, cycle_interval_minutes = ?, initial_equity = ?, paper_starting_balance = ?, updated_at = ? WHERE id = ?`,
       input.name ?? current.name,
       input.aiModelId ?? current.aiModelId,
       /*
@@ -635,6 +654,7 @@ export const traders = {
       'strategyId' in input ? (input.strategyId ?? null) : current.strategyId,
       input.cycleIntervalMinutes ?? current.cycleIntervalMinutes,
       input.initialEquity ?? current.initialEquity,
+      input.paperStartingBalance ?? current.paperStartingBalance,
       now(),
       id,
     );
@@ -2475,6 +2495,25 @@ export const trades = {
    * @param sinceIso 窗口起点（含）。调用方给固定长度的窗口（例如最近 24 小时），
    *   所以窗口内的行数由**交易频率**决定，而不是由历史长度决定。
    */
+  /**
+   * **这台机器人累计的已实现净盈亏**（毛盈亏 − 手续费 − 资金费），全生命周期。
+   *
+   * 给模拟盘钱包用（见 `binance/paperWallet.ts`）：`walletBalance = 起始余额 + 它`。
+   *
+   * 与 `performanceSince` 的区别：那个要一个时间窗（用于"最近表现"），
+   * 而钱包要的是**从建仓到今天**的总数 —— 少算一笔，余额就对不上。
+   *
+   * ⚠️ 用 `netPnlOf` 那个口径（表里的 `net_pnl` 列已经是按它算好的），
+   * **不要在这里重写算式**：那会让"余额"和"界面上的净盈亏"变成两套算法。
+   */
+  lifetimeNetPnl(traderId: number): number {
+    const row = getDb().get<{ netPnl: number | null }>(
+      'SELECT COALESCE(SUM(net_pnl), 0) AS netPnl FROM trades WHERE trader_id = ?',
+      traderId,
+    );
+    return row?.netPnl ?? 0;
+  },
+
   performanceSince(traderId: number, sinceIso: string): TradePerformance {
     const row = getDb().get<{
       totalTrades: number;

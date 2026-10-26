@@ -112,6 +112,23 @@ export interface BrokerOptions {
   dryRun?: boolean;
   /** How long `waitForFill` polls before giving up. */
   fillTimeoutMs?: number;
+  /**
+   * **模拟盘的账户读数来源**（用户 2026-10-27 需求）。
+   *
+   * 传了它就**不再向交易所请求账户**，而是用这个函数返回的本地快照。
+   * 于是模拟盘机器人可以**完全没有真实交易所账户** —— 这正是
+   * 「无需真实账户就能开启模拟盘机器人」那条需求的落点。
+   *
+   * ## 为什么做成注入而不是在 `getAccountState` 里判 `dryRun`
+   *
+   * 因为余额的**算式**属于台账（已实现盈亏、持仓浮盈、保证金占用都在那边），
+   * 而 broker 不该知道台账长什么样。注入让 `binance/` 这一层保持"只谈交易所"，
+   * 台账那层负责给出数字 —— 两边各自的职责没有被搅在一起。
+   *
+   * ⚠️ **只在 `dryRun === true` 时才会被使用**（见 `getAccountState`）：
+   * 实盘路径永远读交易所。这保证"多传了一个参数"不可能让实盘看到假余额。
+   */
+  paperAccount?: () => AccountState | Promise<AccountState>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -144,6 +161,9 @@ export class BinanceBroker {
   private readonly dryRun: boolean;
   private readonly fillTimeoutMs: number;
 
+  /** 模拟盘账户读数来源；`null` 表示"没有提供"，仍走交易所。 */
+  private readonly paperAccount: (() => AccountState | Promise<AccountState>) | null;
+
   constructor(
     private readonly rest: BinanceRest,
     private readonly market: BinanceMarketData,
@@ -152,6 +172,7 @@ export class BinanceBroker {
   ) {
     this.dryRun = options.dryRun ?? false;
     this.fillTimeoutMs = options.fillTimeoutMs ?? 10_000;
+    this.paperAccount = options.paperAccount ?? null;
   }
 
   get isDryRun(): boolean {
@@ -162,7 +183,24 @@ export class BinanceBroker {
   /*  Account                                                                */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Account snapshot.
+   *
+   * ## 模拟盘读本地台账，实盘读交易所（2026-10-27）
+   *
+   * 原来这里无条件 `fetchAccountState(this.rest)` —— 一次**真实的、签名的**
+   * `/fapi/v3/account` 请求。于是 `dryRun=true` 只模拟了"下单"，账户余额仍然是
+   * 真金白银，且**没有真实 API Key 时连模拟盘都起不来**。
+   *
+   * 现在：`dryRun && paperAccount` 走本地台账，其余一律走交易所。
+   *
+   * ⚠️ **判据里同时要求 `dryRun`**，不只是"提供了 paperAccount"：
+   * 让实盘路径没有任何办法读到模拟余额。一个被误传的参数不该能让实盘
+   * 看到假数字 —— 那是本仓库最不能接受的那类故障（"一个字段说模拟、
+   * 另一个字段在下真单"）。
+   */
   async getAccountState(): Promise<AccountState> {
+    if (this.dryRun && this.paperAccount) return await this.paperAccount();
     return fetchAccountState(this.rest);
   }
 

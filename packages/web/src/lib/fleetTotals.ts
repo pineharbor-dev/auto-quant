@@ -50,6 +50,16 @@ import type { EquityContributor } from '../components/equityCurve';
 export function groupTradersByAccount(traders: readonly TraderRow[]): Map<number, TraderRow[]> {
   const groups = new Map<number, TraderRow[]>();
   for (const trader of traders) {
+    /*
+     * ⚠️ **没有交易所账户的机器人不参与这个分组**（用户 2026-10-27 需求）。
+     *
+     * 纯模拟盘机器人（`exchangeAccountId === null`）的钱是**本地模拟出来的**，
+     * 它不对应任何真实钱包。把它塞进"按账户汇总"里会凭空造出一个
+     * 「账户权益」—— 而那个数字会被读成"我在交易所里有这么多钱"。
+     *
+     * 它的模拟余额在机器人自己的详情页上显示（那里明确标注是模拟盘）。
+     */
+    if (trader.exchangeAccountId === null) continue;
     const group = groups.get(trader.exchangeAccountId);
     if (group) group.push(trader);
     else groups.set(trader.exchangeAccountId, [trader]);

@@ -6128,6 +6128,9 @@ export class AutoTrader {
     const open = positionStore.open(traderId);
     if (open.length === 0) return;
 
+    /* 本轮读到的标记价，顺手喂给模拟盘钱包（见 `paperMarkPrices`）。 */
+    const marks: Array<{ symbol: string; markPrice: number }> = [];
+
     for (const local of open) {
       let mark = 0;
       try {
@@ -6140,6 +6143,7 @@ export class AutoTrader {
         continue;
       }
       if (!(mark > 0)) continue;
+      marks.push({ symbol: local.symbol, markPrice: mark });
 
       const isLong = local.side === 'long';
       const stop = local.stop_loss;
@@ -6190,6 +6194,42 @@ export class AutoTrader {
 
       await this.bookClosedPosition(local, reason, exitPrice, exitFee);
     }
+
+    /* 整轮读完后统一记一次，供模拟盘钱包算浮盈（见 `paperMarkPrices`）。 */
+    this.rememberMarkPrices(marks);
+  }
+
+  /**
+   * **最近一次读到的标记价快照**（symbol → markPrice）。
+   *
+   * 用途只有一个：让 `TraderManager` 能在**同步**上下文里给模拟盘钱包算浮盈
+   *（`paperAccountStateOf` 是 `getAccountState()` 的实现，而那个签名是同步友好的）。
+   *
+   * 为什么不在这里现拉一次行情：`getAccountState()` 每个周期都会被调用，
+   * 而行情本来就已经在周期里拉过了 —— 再拉一次等于把一个纯读数变成一次网络请求，
+   * 且会在"行情接口抖动"时让账户读数跟着失败。缓存住的这一份足够算浮盈。
+   *
+   * 没读过时是空 Map：调用方按"浮盈 0"处理，**不编造价格**。
+   */
+  private markPriceSnapshot = new Map<string, number>();
+
+  /** 最近一次的标记价快照（只读，供模拟盘钱包折算浮盈）。 */
+  paperMarkPrices(): ReadonlyMap<string, number> {
+    return this.markPriceSnapshot;
+  }
+
+  /**
+   * 记下本轮读到的标记价，供 `paperMarkPrices()` 使用。
+   *
+   * 只保留**当前有持仓的**标的：全市场 500 多个 symbol 的 Map 会一直占着内存，
+   * 而模拟盘钱包只关心自己拿着的那几个。
+   */
+  private rememberMarkPrices(rows: ReadonlyArray<{ symbol: string; markPrice: number }>): void {
+    const next = new Map<string, number>();
+    for (const row of rows) {
+      if (Number.isFinite(row.markPrice) && row.markPrice > 0) next.set(row.symbol, row.markPrice);
+    }
+    if (next.size > 0) this.markPriceSnapshot = next;
   }
 
   /**
@@ -8172,7 +8212,29 @@ etPnlOf —— 见它的注释（资金费的符号）。 */
      * 是新的、`gap` 一模一样 —— **因为没有任何一项能告诉我改动到底作用在哪一侧**，
      * 只能再从头推一遍。把分项存下来，这个问题下次当场就答完了。
      */
-    const platformSelf = tradeStore.netSinceForAccount(this.deps.trader.exchangeAccountId, sinceIso);
+    /*
+     * 纯模拟盘（没有交易所账户）**没有交易所侧可对** —— `netSinceForAccount`
+     * 按账户聚合，而没有账户就没有这个维度。这类机器人跳过整段总账校验：
+     * 它的账全部来自本地台账，不存在"与交易所流水对不上"这回事。
+     *
+     * ⚠️ 模拟盘但**绑定了**账户的机器人仍然会走到下面 —— 那时账户是存在的，
+     * 只是交易所流水里没有它的单（那些单从来没发出去），所以校验结果会如实地
+     * 报出差额。这是对的：它如实描述了"模拟单不在交易所流水里"这个事实。
+     */
+    const accountId = this.deps.trader.exchangeAccountId;
+    if (accountId === null) {
+      /* 没有账户 = 没有交易所流水可对；外部活动那几项也一并记 0。 */
+      return {
+        recovered: 0,
+        corrected: 0,
+        correctedAttempted: 0,
+        correctedKept: 0,
+        funding: 0,
+        foreignRounds: foreign.length,
+        foreignNet: foreignNet,
+      };
+    }
+    const platformSelf = tradeStore.netSinceForAccount(accountId, sinceIso);
     /*
      * ⚠️ **未平仓的持有成本必须加在平台侧，否则这个校验会永久误报。**
      *

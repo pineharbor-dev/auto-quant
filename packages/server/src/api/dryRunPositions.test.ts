@@ -421,10 +421,32 @@ describe('模拟盘：交易所读数失败也不影响它的持仓', () => {
       '★ 模拟盘不该调交易所的 getPositions —— 那里永远没有它的仓',
     );
     /*
-     * 账户余额那一路仍会试（它是账户级事实），失败就 `null` —— 这**不影响**持仓。
-     * 断言它没有把持仓一起拖下水，而不是断言它一定成功。
+     * ## 账户余额那一路：**不再问交易所**（2026-10-27 语义变更）
+     *
+     * 原来这里断言的是 `body.account === null`，理由写在上面那句注释里：
+     * 「账户余额是账户级事实，仍然只能问交易所」。**那句话已经不成立了。**
+     *
+     * 用户明确要求：「模拟盘不应该根据真实钱包的余额，而应该可以自定义模拟盘的
+     * 余额。也就是说，无需真实账户就能开启模拟盘机器人。」
+     *
+     * 所以模拟盘的账户读数现在由**本地台账**折算（`binance/paperWallet.ts`）：
+     * ```
+     *   walletBalance = 模拟起始余额 + 已实现净盈亏
+     *   equity        = walletBalance + 浮盈
+     * ```
+     * 交易所连接失败与它**完全无关** —— 这比原来"失败就 null"更强：
+     * 一个连不上交易所的模拟盘机器人，账户数字仍然是完整可用的。
+     *
+     * ⚠️ 断言的是"有值且来自本地"，不是"一定等于某个具体数"：
+     * 具体数字由台账决定（起始余额、已实现盈亏、标记价），
+     * 而这里要钉住的是**来源**。
      */
-    assert.equal(body.account, null);
+    assert.notEqual(body.account, null, '★ 模拟盘的账户读数必须来自本地台账，而不是交易所');
+    const account = body.account as Record<string, number>;
+    assert.ok(
+      Number.isFinite(account.walletBalance),
+      `★ 本地钱包必须给出 walletBalance（实际 ${JSON.stringify(body.account)}）`,
+    );
   });
 });
 

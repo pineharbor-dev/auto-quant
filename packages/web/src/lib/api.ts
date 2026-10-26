@@ -834,7 +834,14 @@ export interface StrategyInput {
 
 export interface TraderInput {
   name: string;
-  exchangeAccountId: number;
+  /**
+   * 绑定的交易所账户 —— **`null` = 纯模拟盘机器人**（用户 2026-10-27 需求）。
+   *
+   * 模拟盘不下真实订单、余额由本地台账折算（起始余额来自 `paperStartingBalance`），
+   * 所以它**不需要**任何真实交易所账户。原先这里是 `number`，于是前端根本
+   * 表达不出"我没有账户"这件事。
+   */
+  exchangeAccountId: number | null;
   aiModelId: number;
   /**
    * 这只机器人的策略；**AI 托管时必须传 `null`**。
@@ -865,6 +872,14 @@ export interface TraderInput {
    * operator explicitly chose to type the baseline themselves.
    */
   initialEquity?: number;
+  /**
+   * **模拟盘起始余额**（用户 2026-10-27 需求）。只有纯模拟盘机器人（
+   * `exchangeAccountId === null`）会用它 —— 它是本地钱包的本金。
+   *
+   * 与 `initialEquity` **不是一回事**：后者是"收益率的分母"且会在首次启动时
+   * 被真实钱包余额覆盖，而这个是模拟账户里有多少钱、永不被覆盖。
+   */
+  paperStartingBalance?: number;
   /**
    * 运行模式。
    *

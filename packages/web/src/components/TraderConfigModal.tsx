@@ -25,7 +25,7 @@ export function TraderConfigModal({
   const [busy, setBusy] = useState(false);
 
   const [name, setName] = useState('');
-  const [exchangeAccountId, setExchangeAccountId] = useState(0);
+  const [exchangeAccountId, setExchangeAccountId] = useState<number | ''>(0);
   const [aiModelId, setAiModelId] = useState(0);
   /*
    * `null` = 这个机器人不引用任何策略（AI 托管）。见 `Trader.strategyId` ——
@@ -45,7 +45,8 @@ export function TraderConfigModal({
   const selectedAccount = accounts?.find((row) => row.id === exchangeAccountId) ?? null;
   const equity = useExchangeEquity({
     open,
-    exchangeAccountId,
+    /* `''` = 不绑账户（纯模拟盘）；`useExchangeEquity` 只在有账户时才读交易所。 */
+    exchangeAccountId: exchangeAccountId === '' ? 0 : exchangeAccountId,
     // Editing starts from what the trader was created with; the read replaces
     // it as soon as the credential answers.
     prefill: trader?.initialEquity ?? 0,
@@ -83,7 +84,8 @@ export function TraderConfigModal({
     prefilledFor.current = fillKey;
 
     setName(trader.name);
-    setExchangeAccountId(trader.exchangeAccountId);
+    /* 纯模拟盘机器人没有账户（`null`）—— 编辑态下用 `''` 表示"不绑账户"。 */
+    setExchangeAccountId(trader.exchangeAccountId ?? '');
     setAiModelId(trader.aiModelId);
     setStrategyId(trader.strategyId);
     setCycleIntervalMinutes(trader.cycleIntervalMinutes);
@@ -121,7 +123,8 @@ export function TraderConfigModal({
       const manualEquity = equityPayload(equity);
       const updated = await api.updateTrader(trader.id, {
         name: name.trim(),
-        exchangeAccountId,
+        /* `''` → `null`：允许把机器人改成"不绑账户"（纯模拟盘）。 */
+        exchangeAccountId: exchangeAccountId === '' ? null : exchangeAccountId,
         aiModelId,
         /*
          * AI 托管时 `strategyId` 是 `null` —— 传 `undefined` 让服务端**不动这个字段**

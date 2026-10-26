@@ -1,3 +1,4 @@
+import type { AccountState } from './account.js';
 import { BinanceBroker } from './broker.js';
 import { resolveEndpoints, type BinanceEndpoints, type BinanceEnvironment } from './endpoints.js';
 import { BinanceMarketData } from './market.js';
@@ -44,6 +45,16 @@ export interface ConnectOptions {
    * 这与"每个周期都成立的警告按事件每轮写一次"是同一类问题。
    */
   quiet?: boolean;
+
+  /**
+   * **模拟盘的账户读数来源**（用户 2026-10-27 需求）。
+   *
+   * 传了它、且 `dryRun` 为真时，broker 的 `getAccountState()` 直接返回这里给的
+   * 本地快照，**不再向交易所请求账户**。于是模拟盘机器人可以完全没有真实凭据。
+   *
+   * 只在 `dryRun` 为真时生效 —— 实盘永远读交易所，见 `BinanceBroker.getAccountState`。
+   */
+  paperAccount?: () => AccountState | Promise<AccountState>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -98,6 +109,7 @@ export async function connectExchange(options: ConnectOptions): Promise<Exchange
   const market = new BinanceMarketData(rest);
   const broker = new BinanceBroker(rest, market, registry, {
     dryRun: options.dryRun ?? false,
+    ...(options.paperAccount ? { paperAccount: options.paperAccount } : {}),
   });
 
   return {
@@ -177,6 +189,38 @@ export async function preflight(
 
   /* --- Credentials present --------------------------------------------- */
   if (!connection.rest.hasCredentials) {
+    /*
+     * **模拟盘不需要凭据**（用户 2026-10-27 需求）。
+     *
+     * 它的账户读数来自本地台账（`paperAccount`），下单全程本地模拟 ——
+     * 一条只做公开行情的连接就够用。所以这里给 `ok`，让模拟盘能真正启动。
+     *
+     * ⚠️ **判据是 `dryRun`**，不是"有没有传 requireCredentials"：实盘（dryRun=false）
+     * 即使调用方忘了传 requireCredentials，也**必须**因为没有凭据而失败。
+     * 一个漏传的参数不该让"没有密钥的实盘机器人"启动成功。
+     */
+    if (connection.broker.isDryRun) {
+      checks.push(
+        check(
+          'API 凭据',
+          'ok',
+          '模拟盘：不需要交易所凭据，账户余额与成交全部在本地模拟。',
+        ),
+      );
+      /* 模拟盘的"账户访问 / 交易余额"由本地钱包回答，不能按真实账户判。 */
+      const paper = await connection.broker.getAccountState();
+      checks.push(
+        check(
+          '模拟资金',
+          paper.equity > 0 ? 'ok' : 'error',
+          paper.equity > 0
+            ? `模拟权益 ${paper.equity.toFixed(2)} USDT，可用 ${paper.availableBalance.toFixed(2)} USDT。`
+            : '模拟余额为 0，无法开仓。请在创建机器人时填写起始余额。',
+          paper.equity <= 0,
+        ),
+      );
+      return checks;
+    }
     checks.push(
       check('API 凭据', 'error', '该交易所账户还没有配置 API Key 与 Secret。', options.requireCredentials !== false),
     );
