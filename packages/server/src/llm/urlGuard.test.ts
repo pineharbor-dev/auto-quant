@@ -14,6 +14,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
@@ -233,4 +234,39 @@ test('CIDR / 域名后缀 / 主机名的写法都生效', () => {
 test('白名单不能绕过协议校验', () => {
   /* 协议校验在白名单之前 —— 声明了主机也不该让 file: 通过。 */
   assert.equal(checkOutboundUrl('file:///etc/passwd', parseHostAllowlist('localhost')).allowed, false);
+});
+/* -------------------------------------------------------------------------- */
+/*  部署模板必须露出白名单开关（2026-10-27）                                      */
+/* -------------------------------------------------------------------------- */
+
+test('★★★ 两个 .env.example 都必须提到 ALLOW_PRIVATE_LLM_HOSTS', () => {
+  /*
+   * ## 为什么这条测试存在
+   *
+   * 白名单是**唯一**能让内网端点工作的开关，但它在两个 `.env.example` 里
+   * **都没出现过**（`docs/archive/TRIAGE-20261013-external-issues.md` 记录了
+   * 这个缺口，连续几十轮"已记录未推进"）。
+   *
+   * 后果是用户实际撞上的形态：
+   *
+   *     在「添加 AI 模型」里填 http://127.0.0.1:3425/v1
+   *     → 红色「连接失败：baseUrl 不被允许：回环地址 127.0.0.0/8」
+   *     → 翻遍 `.env.example` 找不到任何开关
+   *     → 只能把这条报错当成 bug
+   *
+   * ⚠️ 这不是"用户没读文档"—— **模板里根本没有这一项**。
+   * 一个受支持的功能如果只在源码注释里存在，对使用者就等于不存在。
+   *
+   * 这条测试钉住的是"模板里有这一项"，不是它的具体取值 ——
+   * 默认留空（全挡）仍然是正确的安全姿态。
+   */
+  for (const rel of ['../../../../.env.example', '../../../../deploy/.env.example']) {
+    const text = readFileSync(new URL(rel, import.meta.url), 'utf8');
+    assert.match(
+      text,
+      /^ALLOW_PRIVATE_LLM_HOSTS=/m,
+      `★ ${rel} 里必须有 ALLOW_PRIVATE_LLM_HOSTS 这一项（留空即可），` +
+        '否则内网端点这个受支持的功能在部署模板里完全不可见。',
+    );
+  }
 });
