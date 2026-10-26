@@ -576,9 +576,38 @@ export const STRATEGY_CONFIG_KEYS = Object.keys(
 /*  Factory defaults + presets                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** A fully-populated config. Zod defaults fill every field. */
+/**
+ * A fully-populated config. Zod defaults fill every field.
+ *
+ * ## ⚠️ 为什么必须补 `coinSource`（2026-10-27 实测踩到）
+ *
+ * schema 的裸默认值是 `sourceType: 'static'` + `staticCoins: []` ——
+ * 也就是**一个候选标的都没有**。于是"新建默认策略"建出来的东西看起来完全正常
+ * （字段齐全、类型正确、界面能打开），但机器人启动时只会写一条：
+ *
+ *     机器人 #N 的配置里没有任何候选标的（静态列表为空、也没开动态候选池）
+ *     —— 它不会交易任何东西。
+ *
+ * 而那条警告**不影响状态**：机器人显示 `running`、每轮周期"成功"、日志干净，
+ * 唯一的症状是**什么都不发生**。本仓对这种形状有明确态度（见 `reachability.ts`）：
+ * 一个"能启动但永远不会交易"的默认值，比一个启动就报错的默认值更糟。
+ *
+ * 所以这里用 `conservative` 预设的 `coinSource` 覆盖 —— 它与 `seedDefaults()`
+ * 创建「默认策略 — 稳健」时用的正是同一个预设，两者口径一致：
+ * `mixed` + BTC/ETH + 动态候选池。
+ *
+ * ⚠️ **只覆盖 `coinSource`，其余分区仍走 schema 默认值。**
+ * 整体换成预设会改变杠杆、风控与门槛，那是一次行为变更，
+ * 而这里要修的只是"没有候选标的"这一个缺陷。
+ */
 export function defaultStrategyConfig(): StrategyConfig {
-  return StrategyConfigSchema.parse({});
+  const base = StrategyConfigSchema.parse({});
+  const conservative = STRATEGY_PRESETS.find((preset) => preset.id === 'conservative');
+  if (!conservative) return base;
+  return StrategyConfigSchema.parse({
+    ...base,
+    coinSource: { ...base.coinSource, ...conservative.patch.coinSource },
+  });
 }
 
 /**
