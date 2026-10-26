@@ -20,6 +20,8 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
 
 import { fetchGuarded } from './http.js';
+import { env } from '../env.js';
+import { checkOutboundUrl, parseHostAllowlist } from './urlGuard.js';
 
 /** 路由器编程好的响应序列，以及每一跳实际观测到的请求。 */
 interface Hop {
@@ -125,8 +127,36 @@ test('★ 重定向循环有上限：不会无限跟随', async () => {
 
 test('★ 一开始就填内网地址：第一跳就被拒（不依赖 fetch 被调用）', async () => {
   route = () => ({ status: 200 });
+
+  /*
+   * ## ⚠️ 目标地址要按**当前生效的白名单**挑
+   *
+   * 这条用例断言"内网地址在第一跳就被拒"。而白名单
+   *（`ALLOW_PRIVATE_LLM_HOSTS`）是**受支持的配置** —— 本地开发者为了让自己的
+   * 内网 LLM 网关能用，会在 `.env` 里写 `ALLOW_PRIVATE_LLM_HOSTS=127.0.0.1`。
+   *
+   * 于是 `http://127.0.0.1:8080` 在那台机器上是**合法目标**，
+   * 这条用例就会红 —— 而红的原因是用户自己的配置，不是代码缺陷。
+   *
+   * 修法：挑一个**当前确实被拒**的地址来验证这条规则。
+   * 下面按优先级找第一个不被白名单放行的候选。
+   */
+  const allowlist = parseHostAllowlist(env.allowPrivateLlmHosts);
+  const candidate =
+    [
+      'http://127.0.0.1:8080/v1/chat',
+      'http://10.255.255.1:8080/v1/chat',
+      'http://169.254.169.254/latest/meta-data/',
+    ].find((url) => !checkOutboundUrl(url, allowlist).allowed) ?? null;
+
+  assert.ok(
+    candidate,
+    '★ 运行环境的 ALLOW_PRIVATE_LLM_HOSTS 放行了全部内网候选，这条用例无从验证 —— ' +
+      '请用一个更窄的白名单（例如只写你自己的网关地址）',
+  );
+
   await assert.rejects(
-    () => fetchGuarded('http://127.0.0.1:8080/v1/chat', { method: 'POST' }),
+    () => fetchGuarded(candidate, { method: 'POST' }),
     /不被允许|拒绝|rejected/i,
   );
   assert.equal(hops.length, 0, '内网地址连一次都不该被拨出去');

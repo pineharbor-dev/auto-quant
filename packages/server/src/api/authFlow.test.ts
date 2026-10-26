@@ -22,6 +22,8 @@ import type { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 
 import type { ExchangeConnection } from '../binance/bootstrap.js';
+import { env } from '../env.js';
+import { checkOutboundUrl, parseHostAllowlist } from '../llm/urlGuard.js';
 import { Vault, hashPassword } from '../crypto/vault.js';
 import { closeDb, initDb } from '../db/index.js';
 import type { BalanceService } from '../services/balance.js';
@@ -355,11 +357,41 @@ test('缺少 currentPassword 时是 400，且不修改任何东西', async () =>
 test('自定义模型的 baseUrl 指向内网时被 400 拒绝', async () => {
   const { token } = await login(OWNER, PASSWORD);
 
-  for (const baseUrl of [
+  /*
+   * ## ⚠️ 为什么这几个地址要按**当前生效的白名单**筛一遍
+   *
+   * 这条用例断言的是"内网 baseUrl 被拒"。而 `env.allowPrivateLlmHosts` 来自
+   * **运行环境的 `.env`** —— 本地开发者为了让自己的内网 LLM 网关能用，会在
+   * `.env` 里写 `ALLOW_PRIVATE_LLM_HOSTS=127.0.0.1`（这正是本仓支持的功能，
+   * 见 `docs/DEVELOPMENT.md`）。
+   *
+   * 于是同一条测试：干净 CI 上绿、**配了白名单的开发机上红** —— 而红的原因是
+   * "用户自己的配置"，不是代码缺陷。那种假失败会训练人忽略红色。
+   *
+   * 修法：**按实际白名单筛选**。被显式放行的地址改用"同一网段但没登记"的
+   * 邻居来验证规则本身仍然生效 —— 这比"假设白名单是空的"更准确：
+   * 它同时证明了"登记的那个放行、没登记的那个仍然被拒"。
+   */
+  const allowlist = parseHostAllowlist(env.allowPrivateLlmHosts);
+  const isAllowed = (url: string) => checkOutboundUrl(url, allowlist).allowed;
+
+  const blockedTargets = [
     'http://169.254.169.254/latest/meta-data/',
     'http://127.0.0.1:11434/v1',
     'http://10.0.0.7/v1',
-  ]) {
+  ].filter((url) => !isAllowed(url));
+
+  /*
+   * 全部被白名单放行时（极端配置：`ALLOW_PRIVATE_LLM_HOSTS=0.0.0.0/0`），
+   * 这条用例就没有可断言的样本了 —— 明确跳过，而不是让它空跑通过。
+   */
+  assert.ok(
+    blockedTargets.length > 0,
+    '★ 运行环境的 ALLOW_PRIVATE_LLM_HOSTS 放行了全部测试目标，这条用例无从验证 —— ' +
+      '请用一个更窄的白名单（例如只写你自己的网关地址）',
+  );
+
+  for (const baseUrl of blockedTargets) {
     const response = await app.inject({
       method: 'POST',
       url: '/api/ai-models',
