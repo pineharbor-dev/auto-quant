@@ -83,7 +83,7 @@ import {
 } from './auth.js';
 import { FailureThrottle, IP_THROTTLE_OPTIONS, USERNAME_THROTTLE_OPTIONS } from './loginThrottle.js';
 import { checkOutboundUrl, parseHostAllowlist } from '../llm/urlGuard.js';
-import { paperAccountState } from '../binance/paperWallet.js';
+import { paperAccountState, validateStartingBalance } from '../binance/paperWallet.js';
 import type { BalanceService } from '../services/balance.js';
 
 const log = createLogger('api');
@@ -2144,6 +2144,38 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
     const paperStartingBalance = parsed.data.paperStartingBalance ?? 0;
     const isPaperOnly = account === null;
 
+    /*
+     * ⚠️ **`paperStartingBalance` 必须真的被校验，不能只靠 zod 的 `min(0)`。**
+     *
+     * zod 只挡住负数。而这两个值都会**静默造成故障**：
+     *
+     *   · `0`     → 本地钱包余额 0，每一笔开仓都被「保证金不足」拒掉。
+     *               界面表现是「机器人 running、每轮成功、但从不交易」——
+     *               本仓反复记录的那类静默失能。
+     *   · `1e12`  → 手滑多按几个 0。之后所有收益率都变成无限接近 0 的百分比，
+     *               而界面上**看不出任何异常**。
+     *
+     * ## 判据是「有没有传这个字段」，不是「值是否 > 0」
+     *
+     * 早先这里写的是 `if (paperStartingBalance > 0)` —— 于是 0 绕过校验。
+     * 而 0 的实际后果是**界面说了假话**：操作员填 0（意思是「我就要 0 本金」），
+     * 系统把它当成「没填」，静默回落到 1000 并**按 1000 开仓**。
+     *
+     * 实测形态（2026-10-27）：POST `paperStartingBalance: 0` 返回 200，
+     * 落库 `paper_starting_balance=0`，但启动后 `initialEquity` 被改写成 1000、
+     * 钱包余额也是 1000 —— **他填的数字在界面上再也找不到**。
+     *
+     * 所以：省略 = 用默认值（合法）；显式传 0 = 明确要求一个做不到的余额
+     *（拒绝并说明）。
+     *
+     * 校验函数在 `binance/paperWallet.ts`（含上下限与面向操作员的中文原因）。
+     * 必须先于 `traders.create()`，否则会留下一条余额荒谬的记录。
+     */
+    if (parsed.data.paperStartingBalance !== undefined) {
+      const invalid = validateStartingBalance(paperStartingBalance);
+      if (invalid) throw new Error(invalid);
+    }
+
     let initialEquity = parsed.data.initialEquity ?? 0;
     let equitySource: 'exchange' | 'manual' | 'paper' | 'unavailable' = 'manual';
 
@@ -2316,6 +2348,19 @@ export async function buildServer(deps: ApiDependencies): Promise<FastifyInstanc
      */
     const current = traders.get(id);
     if (!current) return reply.code(404).send({ error: `找不到机器人 ${id}` });
+
+    /*
+     * **编辑路径也要校验模拟本金**（2026-10-27）。
+     *
+     * 创建那条路已经校验了，但 `PATCH` 原先完全没有 —— 而编辑弹窗**确实**
+     * 能改这个字段。于是同一个约束在两条路上不一致：界面改不了的值，
+     * 直接调 API 能改。那种"漏了一处"的开关等于没接（本仓的既有教训）。
+     */
+    if (parsed.data.paperStartingBalance !== undefined) {
+      const invalid = validateStartingBalance(parsed.data.paperStartingBalance);
+      if (invalid) throw new Error(invalid);
+    }
+
     const requestedAccountId = (parsed.data as { exchangeAccountId?: number }).exchangeAccountId;
     if (requestedAccountId !== undefined && requestedAccountId !== current.exchangeAccountId) {
       return reply.code(400).send({

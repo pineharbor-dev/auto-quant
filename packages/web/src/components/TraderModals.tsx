@@ -354,8 +354,25 @@ export function NewTraderModal({
     if (modelChoice === '' || strategyId === '') return setError('请选择模型与策略。');
     /* 模拟余额填了就必须是个正数 —— 否则静默回落成默认值，用户以为生效了。 */
     const paperAmount = paperBalance.trim() === '' ? 0 : Number(paperBalance);
-    if (paperBalance.trim() !== '' && (!Number.isFinite(paperAmount) || paperAmount <= 0)) {
-      return setError('模拟盘起始余额必须是一个大于 0 的数字。');
+    /*
+     * 边界与服务端 `validateStartingBalance` **必须一致**（上下限都要）。
+     *
+     * 早先这里只判了 `> 0`，于是"填 999999999999"在前端一路绿灯、到服务端才
+     * 被拒 —— 而那种错误在点下"创建"之后才出现，用户已经填完了整个表单。
+     * 前端校验的价值就是**在提交之前**说清楚。
+     *
+     * 下限 10 的理由同服务端：低于它任何仓位都会被最小下单量拒绝。
+     */
+    if (paperBalance.trim() !== '') {
+      if (!Number.isFinite(paperAmount) || paperAmount <= 0) {
+        return setError('模拟盘起始余额必须是一个大于 0 的数字。');
+      }
+      if (paperAmount < 10) {
+        return setError('模拟盘起始余额太小（至少 10 USDT）—— 低于这个数任何仓位都会被最小下单量拒绝。');
+      }
+      if (paperAmount > 1_000_000_000) {
+        return setError('模拟盘起始余额过大（上限 10 亿）。');
+      }
     }
 
     setBusy(true);
