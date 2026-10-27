@@ -196,7 +196,43 @@ for (const [route, label] of ROUTES) {
    * 页头那个字符与 `problems` 用同一个判据算，避免出现"显示 ✅ 却计入 problems"
    * 那种自相矛盾（旧版有这种形态，今天 0 处触发）。
    */
-  const okOld = m.text > 300 && m.realOverflow.length === 0 && m.docOverflow <= 0 && errs === 0 && bad === 0;
+  /*
+   * ## ⚠️ 「正文 > 300 字」不是空白页的正确判据（2026-10-27 实测）
+   *
+   * 这条阈值当初是为了挡一种**假绿灯**（见文件头）：没带凭据时应用把未登录访问
+   * 重定向到 `/login`，脚本量的是登录页（正文固定 496 字），于是报"全部正常"。
+   *
+   * 但它把两件事混在了一个数字里：
+   *
+   *   · **要抓的**：页面被重定向到登录页（= 未登录 / token 过期）；
+   *   · **顺带用的**：正文短 = 可能是空白页。
+   *
+   * 后果是**误伤正常页面**：`/strategy` 在只有一条策略时正文正好 300 字
+   * （表头 + 一行 + 两句说明），而判据是 `> 300` —— 于是它**永远红**，
+   * 而页面上没有任何客观异常。一个因为"内容刚好少"而变红的检查，
+   * 会训练人忽略红叉 —— 本仓对这种事的立场写在 `<文件头>` 与 `docs/AGENTS.md` 里。
+   *
+   * ## 改法：直接判「是不是停在了登录页」
+   *
+   * 重定向到登录页有一个**确定可判**的形状：最终 URL 是 `/login`。
+   * 那比"正文够不够长"准确得多，也不会随页面内容多少而漂移。
+   * 正文长度只保留一个**极低的下限**（`> 50`）用来抓"渲染成空白"，
+   * 不再拿它当"是不是登录页"的替身。
+   */
+  const landedOnLogin = /\/login(?:[?#]|$)/.test(page.url());
+  if (landedOnLogin) {
+    console.log(`      ❌ 被重定向到登录页（${page.url()}）—— 未登录或 token 已过期`);
+  }
+  const blank = m.text <= 50;
+  if (blank) console.log(`      ❌ 正文只有 ${m.text} 字 —— 页面可能渲染成空白`);
+
+  const okOld =
+    !landedOnLogin &&
+    !blank &&
+    m.realOverflow.length === 0 &&
+    m.docOverflow <= 0 &&
+    errs === 0 &&
+    bad === 0;
   const fails = !okOld || m.clippedWithoutTitle.length > 0 || (mdHit && mdGate);
   if (fails) problems++;
   if (mdHit) mdPages.push({ route, ...markdown });
