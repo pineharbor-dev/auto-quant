@@ -49,7 +49,27 @@ export function StrategyListPage() {
   const navigate = useNavigate();
   const catalog = useApp((s) => s.catalog);
   const traders = useApp((s) => s.traders);
-  const query = usePolled((signal) => api.strategies(signal), { intervalMs: 30_000 });
+  /*
+   * ⚠️ **必须等会话就绪再拉取**（2026-10-27 实测）。
+   *
+   * 没有 `enabled` 守卫时，首屏会在 `bootstrap()` 拿到 token **之前**就发出
+   * `/api/strategies` —— 那次请求必然 401，浏览器控制台留下一行红色错误：
+   *
+   *     Failed to load resource: 401 (Unauthorized) @ /api/strategies
+   *
+   * 页面本身随后会渲染正常（token 到了、30 秒轮询也会补上），所以**肉眼看不出问题** ——
+   * 但它是 `npm run ui:check` 判红这一页的唯一原因，而且会让操作员以为
+   * "登录/权限出了问题"。
+   *
+   * 同目录下其它页面（TraderPage / DecisionDetailPage / MarketPage …）都带
+   * `enabled` 守卫，只有这一页漏了。这不是"加载策略"的特例，
+   * 而是**所有需要认证的数据拉取都必须等会话就绪**。
+   */
+  const sessionStatus = useApp((s) => s.status);
+  const query = usePolled((signal) => api.strategies(signal), {
+    intervalMs: 30_000,
+    enabled: sessionStatus === 'authenticated',
+  });
   const [busy, setBusy] = useState<{ kind: 'create' | 'row'; id: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [presetOpen, setPresetOpen] = useState(false);
